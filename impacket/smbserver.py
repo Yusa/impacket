@@ -4251,8 +4251,8 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
         # Allow anonymous logon
         self.__anonymousLogon = True
         
-        # HONEYPOT: Log server startup
-        self.log("HONEYPOT: SMB Server starting with read-only enforcement", logging.INFO)
+        # HONEYPOT: Logger will be initialized in processConfigFile
+        # self.log("HONEYPOT: SMB Server starting with read-only enforcement", logging.INFO)
 
         self.auth_callback = None
 
@@ -4365,8 +4365,8 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
     def removeConnection(self, name):
         try:
-            # HONEYPOT: Log connection removal
-            if name in self.__activeConnections:
+            # HONEYPOT: Log connection removal (check if logger is initialized)
+            if name in self.__activeConnections and hasattr(self, '_SMBSERVER__log') and self.__log:
                 client_ip = self.__activeConnections[name].get('ClientIP', 'unknown')
                 self.log(f"HONEYPOT: Connection closed from {client_ip} (ID: {name})", logging.INFO)
             del (self.__activeConnections[name])
@@ -4393,8 +4393,9 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.__activeConnections[name]['SigningSessionKey'] = b''
         self.__activeConnections[name]['Authenticated'] = False
         
-        # HONEYPOT: Log new connection
-        self.log(f"HONEYPOT: New connection from {ip}:{port} (ID: {name})", logging.INFO)
+        # HONEYPOT: Log new connection (check if logger is initialized)
+        if hasattr(self, '_SMBSERVER__log') and self.__log:
+            self.log(f"HONEYPOT: New connection from {ip}:{port} (ID: {name})", logging.INFO)
 
     def getActiveConnections(self):
         return self.__activeConnections
@@ -4999,6 +5000,9 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                                 datefmt='%m/%d/%Y %I:%M:%S %p',
                                 force=True)
         self.__log = LOG
+
+        # HONEYPOT: Log server startup after logger is initialized
+        self.log("HONEYPOT: SMB Server initialized with read-only enforcement", logging.INFO)
 
         # Process the credentials
         credentials_fname = self.__serverConfig.get('global', 'credentials_file')
