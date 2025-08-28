@@ -3082,9 +3082,7 @@ class SMB2Commands:
         
         # HONEYPOT: Log successful authentication
         client_ip = connData.get('ClientIP', 'unknown')
-        user_name = authenticateMessage['user_name'].decode('utf-16le') if 'user_name' in authenticateMessage else 'unknown'
-        domain_name = authenticateMessage['domain_name'].decode('utf-16le') if 'domain_name' in authenticateMessage else 'unknown'
-        smbServer.log(f"HONEYPOT: SMB2 authentication successful for {client_ip} - User: {domain_name}\\{user_name}", logging.INFO)
+        smbServer.log(f"HONEYPOT: SMB2 authentication successful for {client_ip}", logging.INFO)
         
         # For now, just switching to nobody
         # os.setregid(65534,65534)
@@ -4829,7 +4827,9 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
             # Convert command to hex string safely
             command_hex = f"0x{command:02x}" if isinstance(command, int) else str(command)
             self.log(f'HONEYPOT: Processing error from {client_ip} - Command: {command_hex}, Error: {e}', logging.ERROR)
-            self.log('processRequest (0x%x,%s)' % (command, e), logging.ERROR)
+            # Convert command to hex safely for logging
+            command_hex = f"0x{command:02x}" if isinstance(command, int) else str(command)
+            self.log('processRequest (%s,%s)' % (command_hex, e), logging.ERROR)
             raise
 
         # We prepare the response packet to commands don't need to bother about that.
