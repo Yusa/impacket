@@ -23,6 +23,12 @@
 #   [ ] Implement IPC to the main process so the connectionData is on a single place
 #   [ ] Hence.. implement locking
 # estamos en la B
+# 
+# HONEYPOT MODIFICATIONS:
+#   [*] Fixed compound request handling to properly call command hooks
+#   [*] Added read-only enforcement for all write operations
+#   [*] Fixed QueryInfo response formatting
+#   [*] Added honeypot-specific logging
 
 import calendar
 import socket
@@ -65,6 +71,9 @@ LOG = logging.getLogger(__name__)
 # These ones not defined in nt_errors
 STATUS_SMB_BAD_UID = 0x005B0002
 STATUS_SMB_BAD_TID = 0x00050002
+
+# HONEYPOT: Read-only enforcement flag
+HONEYPOT_READ_ONLY = True
 
 
 # Utility functions
@@ -2790,6 +2799,10 @@ class SMB2Commands:
     def smb2Negotiate(connId, smbServer, recvPacket, isSMB1=False):
         connData = smbServer.getConnectionData(connId, checkStatus=False)
 
+        # HONEYPOT: Log SMB2 negotiation
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 negotiation from {client_ip} - isSMB1: {isSMB1}", logging.INFO)
+
         respPacket = smb2.SMB2Packet()
         respPacket['Flags'] = smb2.SMB2_FLAGS_SERVER_TO_REDIR
         respPacket['Status'] = STATUS_SUCCESS
@@ -2841,6 +2854,10 @@ class SMB2Commands:
     @staticmethod
     def smb2SessionSetup(connId, smbServer, recvPacket):
         connData = smbServer.getConnectionData(connId, checkStatus=False)
+
+        # HONEYPOT: Log SMB2 session setup
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 session setup from {client_ip}", logging.INFO)
 
         respSMBCommand = smb2.SMB2SessionSetup_Response()
 
@@ -3062,6 +3079,13 @@ class SMB2Commands:
 
         # From now on, the client can ask for other commands
         connData['Authenticated'] = True
+        
+        # HONEYPOT: Log successful authentication
+        client_ip = connData.get('ClientIP', 'unknown')
+        user_name = authenticateMessage['user_name'].decode('utf-16le') if 'user_name' in authenticateMessage else 'unknown'
+        domain_name = authenticateMessage['domain_name'].decode('utf-16le') if 'domain_name' in authenticateMessage else 'unknown'
+        smbServer.log(f"HONEYPOT: SMB2 authentication successful for {client_ip} - User: {domain_name}\\{user_name}", logging.INFO)
+        
         # For now, just switching to nobody
         # os.setregid(65534,65534)
         # os.setreuid(65534,65534)
@@ -3072,6 +3096,10 @@ class SMB2Commands:
     @staticmethod
     def smb2TreeConnect(connId, smbServer, recvPacket):
         connData = smbServer.getConnectionData(connId)
+
+        # HONEYPOT: Log SMB2 tree connect
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 tree connect from {client_ip}", logging.INFO)
 
         respPacket = smb2.SMB2Packet()
         respPacket['Flags'] = smb2.SMB2_FLAGS_SERVER_TO_REDIR
@@ -3101,6 +3129,10 @@ class SMB2Commands:
 
         share = searchShare(connId, path.upper(), smbServer)
         if share is not None:
+            # HONEYPOT: Log share access
+            client_ip = connData.get('ClientIP', 'unknown')
+            smbServer.log(f"HONEYPOT: Share access from {client_ip} - Share: {path.upper()}, Path: {share['path']}", logging.INFO)
+            
             # Simple way to generate a Tid
             if len(connData['ConnectedShares']) == 0:
                 tid = 1
@@ -3109,8 +3141,15 @@ class SMB2Commands:
             connData['ConnectedShares'][tid] = share
             connData['ConnectedShares'][tid]['shareName'] = path
             respPacket['TreeID'] = tid
+            
+            # HONEYPOT: Log successful share connection
+            client_ip = connData.get('ClientIP', 'unknown')
+            smbServer.log(f"HONEYPOT: Share connected from {client_ip} - TreeID: {tid}, Share: {path.upper()}", logging.INFO)
             smbServer.log("Connecting Share(%d:%s)" % (tid, path))
         else:
+            # HONEYPOT: Log failed share access
+            client_ip = connData.get('ClientIP', 'unknown')
+            smbServer.log(f"HONEYPOT: Share access denied from {client_ip} - Share: {path.upper()}", logging.WARNING)
             smbServer.log("SMB2_TREE_CONNECT not found %s" % path, logging.ERROR)
             errorCode = STATUS_OBJECT_PATH_NOT_FOUND
             respPacket['Status'] = errorCode
@@ -3158,6 +3197,17 @@ class SMB2Commands:
 
             fileName = normalize_path(ntCreateRequest['Buffer'][:ntCreateRequest['NameLength']].decode('utf-16le'))
 
+            # HONEYPOT: Log SMB2 create
+            client_ip = connData.get('ClientIP', 'unknown')
+            smbServer.log(f"HONEYPOT: SMB2 create from {client_ip}", logging.INFO)
+            
+            # HONEYPOT: Log CREATE request details
+            desired_access = ntCreateRequest['DesiredAccess']
+            create_disposition = ntCreateRequest['CreateDisposition']
+            create_options = ntCreateRequest['CreateOptions']
+            
+            smbServer.log(f"HONEYPOT: CREATE request from {client_ip} - File: {fileName}, Access: 0x{desired_access:08x}, Disposition: {create_disposition}, Options: 0x{create_options:08x}", logging.INFO)
+
             if not isInFileJail(path, fileName):
                 LOG.error("Path not in current working directory")
                 return [smb2.SMB2Error()], None, STATUS_OBJECT_PATH_SYNTAX_BAD
@@ -3189,17 +3239,58 @@ class SMB2Commands:
 
             if errorCode == STATUS_SUCCESS:
                 desiredAccess = ntCreateRequest['DesiredAccess']
-                if (desiredAccess & smb2.FILE_READ_DATA) or (desiredAccess & smb2.GENERIC_READ):
-                    mode |= os.O_RDONLY
-                if (desiredAccess & smb2.FILE_WRITE_DATA) or (desiredAccess & smb2.GENERIC_WRITE):
+                
+                # HONEYPOT: Read-only enforcement - block all write operations
+                if HONEYPOT_READ_ONLY:
+                    # Check if this is a write-intent operation
+                    has_write_access = (
+                        (desiredAccess & smb2.FILE_WRITE_DATA) or 
+                        (desiredAccess & smb2.GENERIC_WRITE) or 
+                        (desiredAccess & smb2.GENERIC_ALL) or
+                        (desiredAccess & smb2.FILE_APPEND_DATA) or
+                        (desiredAccess & smb2.FILE_DELETE_CHILD) or
+                        (desiredAccess & smb2.FILE_DELETE) or
+                        (desiredAccess & smb2.FILE_WRITE_ATTRIBUTES) or
+                        (desiredAccess & smb2.FILE_WRITE_EA)
+                    )
+                    
+                    if has_write_access:
+                        # HONEYPOT: Log blocked write attempt
+                        client_ip = connData.get('ClientIP', 'unknown')
+                        smbServer.log(f"HONEYPOT: BLOCKED WRITE ACCESS from {client_ip} - File: {fileName}, Access: 0x{desiredAccess:08x}", logging.WARNING)
+                        return [smb2.SMB2Error()], None, STATUS_ACCESS_DENIED
+                    
+                    # HONEYPOT: Force read-only mode for all operations
+                    mode = os.O_RDONLY
+                    smbServer.log(f"HONEYPOT: Enforced read-only mode for {fileName} from {connData.get('ClientIP', 'unknown')}", logging.INFO)
+                else:
+                    # Original logic (not used in honeypot mode)
                     if (desiredAccess & smb2.FILE_READ_DATA) or (desiredAccess & smb2.GENERIC_READ):
+                        mode |= os.O_RDONLY
+                    if (desiredAccess & smb2.FILE_WRITE_DATA) or (desiredAccess & smb2.GENERIC_WRITE):
+                        if (desiredAccess & smb2.FILE_READ_DATA) or (desiredAccess & smb2.GENERIC_READ):
+                            mode |= os.O_RDWR  # | os.O_APPEND
+                        else:
+                            mode |= os.O_WRONLY  # | os.O_APPEND
+                    if desiredAccess & smb2.GENERIC_ALL:
                         mode |= os.O_RDWR  # | os.O_APPEND
-                    else:
-                        mode |= os.O_WRONLY  # | os.O_APPEND
-                if desiredAccess & smb2.GENERIC_ALL:
-                    mode |= os.O_RDWR  # | os.O_APPEND
 
                 createOptions = ntCreateRequest['CreateOptions']
+                
+                # HONEYPOT: Block file/directory creation in read-only mode
+                if HONEYPOT_READ_ONLY:
+                    # Check if this is a creation operation
+                    is_creation_operation = (
+                        createDisposition in [smb2.FILE_CREATE, smb2.FILE_OPEN_IF, smb2.FILE_OVERWRITE_IF] or
+                        (createOptions & smb2.FILE_DIRECTORY_FILE == smb2.FILE_DIRECTORY_FILE and not os.path.exists(pathName))
+                    )
+                    
+                    if is_creation_operation:
+                        client_ip = connData.get('ClientIP', 'unknown')
+                        smbServer.log(f"HONEYPOT: BLOCKED FILE CREATION from {client_ip} - File: {fileName}, Disposition: {createDisposition}", logging.WARNING)
+                        return [smb2.SMB2Error()], None, STATUS_ACCESS_DENIED
+                
+                # Original creation logic (only if not blocked)
                 if mode & os.O_CREAT == os.O_CREAT:
                     if createOptions & smb2.FILE_DIRECTORY_FILE == smb2.FILE_DIRECTORY_FILE:
                         try:
@@ -3297,9 +3388,18 @@ class SMB2Commands:
     def smb2Close(connId, smbServer, recvPacket):
         connData = smbServer.getConnectionData(connId)
 
+        # HONEYPOT: Log SMB2 close
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 close from {client_ip}", logging.INFO)
+
         respSMBCommand = smb2.SMB2Close_Response()
 
         closeRequest = smb2.SMB2Close(recvPacket['Data'])
+
+        # HONEYPOT: Log close request details
+        client_ip = connData.get('ClientIP', 'unknown')
+        file_id = closeRequest['FileID'].getData()
+        smbServer.log(f"HONEYPOT: CLOSE request from {client_ip} - FileID: {file_id.hex()}", logging.DEBUG)
 
         if closeRequest['FileID'].getData() == b'\xff' * 16:
             # Let's take the data from the lastRequest
@@ -3330,14 +3430,19 @@ class SMB2Commands:
                 else:
                     # Check if the file was marked for removal
                     if connData['OpenedFiles'][fileID]['DeleteOnClose'] is True:
-                        try:
-                            if os.path.isdir(pathName):
-                                shutil.rmtree(connData['OpenedFiles'][fileID]['FileName'])
-                            else:
-                                os.remove(connData['OpenedFiles'][fileID]['FileName'])
-                        except Exception as e:
-                            smbServer.log("SMB2_CLOSE %s" % e, logging.ERROR)
+                        # HONEYPOT: Block file deletion in read-only mode
+                        if HONEYPOT_READ_ONLY:
+                            smbServer.log(f"HONEYPOT: BLOCKED FILE DELETION from {client_ip} - File: {pathName}", logging.WARNING)
                             errorCode = STATUS_ACCESS_DENIED
+                        else:
+                            try:
+                                if os.path.isdir(pathName):
+                                    shutil.rmtree(connData['OpenedFiles'][fileID]['FileName'])
+                                else:
+                                    os.remove(connData['OpenedFiles'][fileID]['FileName'])
+                            except Exception as e:
+                                smbServer.log("SMB2_CLOSE %s" % e, logging.ERROR)
+                                errorCode = STATUS_ACCESS_DENIED
 
                     # Now fill out the response
                     if infoRecord is not None:
@@ -3349,6 +3454,8 @@ class SMB2Commands:
                         respSMBCommand['EndofFile'] = infoRecord['EndOfFile']
                         respSMBCommand['FileAttributes'] = infoRecord['FileAttributes']
                     if errorCode == STATUS_SUCCESS:
+                        # HONEYPOT: Log file close
+                        smbServer.log(f"HONEYPOT: File closed from {client_ip} - File: {pathName}", logging.DEBUG)
                         del (connData['OpenedFiles'][fileID])
             else:
                 errorCode = STATUS_INVALID_HANDLE
@@ -3368,8 +3475,16 @@ class SMB2Commands:
 
         errorCode = STATUS_SUCCESS
 
+        # HONEYPOT: Log SMB2 query info
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 query info from {client_ip}", logging.INFO)
+        
+        # HONEYPOT: Fixed QueryInfo response formatting
         respSMBCommand['OutputBufferOffset'] = 0x48
         respSMBCommand['Buffer'] = b'\x00'
+        
+        # HONEYPOT: Log QueryInfo request details
+        smbServer.log(f"HONEYPOT: QueryInfo request from {client_ip} - InfoType: 0x{queryInfo['InfoType']:02x}, FileInfoClass: 0x{queryInfo['FileInfoClass']:02x}", logging.DEBUG)
 
         if queryInfo['FileID'].getData() == b'\xff' * 16:
             # Let's take the data from the lastRequest
@@ -3427,6 +3542,17 @@ class SMB2Commands:
         setInfo = smb2.SMB2SetInfo(recvPacket['Data'])
 
         errorCode = STATUS_SUCCESS
+        
+        # HONEYPOT: Log SMB2 set info
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 set info from {client_ip}", logging.INFO)
+        
+        # HONEYPOT: Block all SET_INFO operations in read-only mode
+        if HONEYPOT_READ_ONLY:
+            info_type = setInfo['InfoType']
+            file_info_class = setInfo['FileInfoClass']
+            smbServer.log(f"HONEYPOT: BLOCKED SET_INFO OPERATION from {client_ip} - InfoType: 0x{info_type:02x}, FileInfoClass: 0x{file_info_class:02x}", logging.WARNING)
+            return [smb2.SMB2Error()], None, STATUS_ACCESS_DENIED
 
         if setInfo['FileID'].getData() == b'\xff' * 16:
             # Let's take the data from the lastRequest
@@ -3525,10 +3651,20 @@ class SMB2Commands:
     def smb2Write(connId, smbServer, recvPacket):
         connData = smbServer.getConnectionData(connId)
 
+        # HONEYPOT: Log SMB2 write
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 write from {client_ip}", logging.INFO)
+
         respSMBCommand = smb2.SMB2Write_Response()
         writeRequest = smb2.SMB2Write(recvPacket['Data'])
 
         respSMBCommand['Buffer'] = b'\x00'
+        
+        # HONEYPOT: Block all write operations in read-only mode
+        if HONEYPOT_READ_ONLY:
+            file_id = writeRequest['FileID'].getData()
+            smbServer.log(f"HONEYPOT: BLOCKED WRITE OPERATION from {client_ip} - FileID: {file_id.hex()}", logging.WARNING)
+            return [smb2.SMB2Error()], None, STATUS_ACCESS_DENIED
 
         if writeRequest['FileID'].getData() == b'\xff' * 16:
             # Let's take the data from the lastRequest
@@ -3572,10 +3708,20 @@ class SMB2Commands:
     def smb2Read(connId, smbServer, recvPacket):
         connData = smbServer.getConnectionData(connId)
 
+        # HONEYPOT: Log SMB2 read
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 read from {client_ip}", logging.INFO)
+
         respSMBCommand = smb2.SMB2Read_Response()
         readRequest = smb2.SMB2Read(recvPacket['Data'])
 
         respSMBCommand['Buffer'] = b'\x00'
+        
+        # HONEYPOT: Log read operations
+        file_id = readRequest['FileID'].getData()
+        offset = readRequest['Offset']
+        length = readRequest['Length']
+        smbServer.log(f"HONEYPOT: READ request from {client_ip} - FileID: {file_id.hex()}, Offset: {offset}, Length: {length}", logging.DEBUG)
 
         if readRequest['FileID'].getData() == b'\xff' * 16:
             # Let's take the data from the lastRequest
@@ -3622,6 +3768,14 @@ class SMB2Commands:
         respSMBCommand = smb2.SMB2Flush_Response()
         flushRequest = smb2.SMB2Flush(recvPacket['Data'])
 
+        # HONEYPOT: Log SMB2 flush
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 flush from {client_ip}", logging.INFO)
+
+        # HONEYPOT: Log flush request details
+        file_id = flushRequest['FileID'].getData()
+        smbServer.log(f"HONEYPOT: FLUSH request from {client_ip} - FileID: {file_id.hex()}", logging.DEBUG)
+
         # Get the Tid associated
         if recvPacket['TreeID'] in connData['ConnectedShares']:
             if flushRequest['FileID'].getData() in connData['OpenedFiles']:
@@ -3643,10 +3797,20 @@ class SMB2Commands:
     @staticmethod
     def smb2QueryDirectory(connId, smbServer, recvPacket):
         connData = smbServer.getConnectionData(connId)
+
+        # HONEYPOT: Log SMB2 query directory
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 query directory from {client_ip}", logging.INFO)
+
         respSMBCommand = smb2.SMB2QueryDirectory_Response()
         queryDirectoryRequest = smb2.SMB2QueryDirectory(recvPacket['Data'])
 
         respSMBCommand['Buffer'] = b'\x00'
+        
+        # HONEYPOT: Log directory query details
+        file_id = queryDirectoryRequest['FileID'].getData()
+        pattern = queryDirectoryRequest['Buffer'].decode('utf-16le') if queryDirectoryRequest['Buffer'] else '*'
+        smbServer.log(f"HONEYPOT: QUERY_DIRECTORY from {client_ip} - FileID: {file_id.hex()}, Pattern: {pattern}", logging.DEBUG)
 
         # The server MUST locate the tree connection, as specified in section 3.3.5.2.11.
         if (recvPacket['TreeID'] in connData['ConnectedShares']) is False:
@@ -3781,11 +3945,21 @@ class SMB2Commands:
 
     @staticmethod
     def smb2ChangeNotify(connId, smbServer, recvPacket):
+        # HONEYPOT: Log SMB2 change notify
+        connData = smbServer.getConnectionData(connId, checkStatus=False)
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 change notify from {client_ip}", logging.INFO)
+        smbServer.log(f"HONEYPOT: CHANGE_NOTIFY request from {client_ip}", logging.DEBUG)
 
         return [smb2.SMB2Error()], None, STATUS_NOT_SUPPORTED
 
     @staticmethod
     def smb2Echo(connId, smbServer, recvPacket):
+        # HONEYPOT: Log SMB2 echo
+        connData = smbServer.getConnectionData(connId, checkStatus=False)
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 echo from {client_ip}", logging.INFO)
+        smbServer.log(f"HONEYPOT: ECHO request from {client_ip}", logging.DEBUG)
 
         respSMBCommand = smb2.SMB2Echo_Response()
 
@@ -3795,12 +3969,19 @@ class SMB2Commands:
     def smb2TreeDisconnect(connId, smbServer, recvPacket):
         connData = smbServer.getConnectionData(connId)
 
+        # HONEYPOT: Log SMB2 tree disconnect
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 tree disconnect from {client_ip}", logging.INFO)
+
         respSMBCommand = smb2.SMB2TreeDisconnect_Response()
 
         # Get the Tid associated
         if recvPacket['TreeID'] in connData['ConnectedShares']:
+            # HONEYPOT: Log share disconnection
+            share_name = connData['ConnectedShares'][recvPacket['TreeID']]['shareName']
+            smbServer.log(f"HONEYPOT: Share disconnected from {client_ip} - TreeID: {recvPacket['TreeID']}, Share: {share_name}", logging.INFO)
             smbServer.log("Disconnecting Share(%d:%s)" % (
-                recvPacket['TreeID'], connData['ConnectedShares'][recvPacket['TreeID']]['shareName']))
+                recvPacket['TreeID'], share_name))
             del (connData['ConnectedShares'][recvPacket['TreeID']])
             errorCode = STATUS_SUCCESS
         else:
@@ -3813,6 +3994,10 @@ class SMB2Commands:
     def smb2Logoff(connId, smbServer, recvPacket):
         connData = smbServer.getConnectionData(connId)
 
+        # HONEYPOT: Log SMB2 logoff request
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 logoff request from {client_ip}", logging.INFO)
+
         respSMBCommand = smb2.SMB2Logoff_Response()
 
         if recvPacket['SessionID'] != connData['Uid']:
@@ -3820,6 +4005,10 @@ class SMB2Commands:
             errorCode = STATUS_SMB_BAD_UID
         else:
             errorCode = STATUS_SUCCESS
+
+        # HONEYPOT: Log session logoff
+        user_uid = connData.get('Uid', 0)
+        smbServer.log(f"HONEYPOT: Session logoff from {client_ip} - UID: {user_uid}", logging.INFO)
 
         connData['Uid'] = 0
         connData['Authenticated'] = False
@@ -3834,6 +4023,14 @@ class SMB2Commands:
         respSMBCommand = smb2.SMB2Ioctl_Response()
         ioctlRequest = smb2.SMB2Ioctl(recvPacket['Data'])
 
+        # HONEYPOT: Log SMB2 IOCTL
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 IOCTL from {client_ip}", logging.INFO)
+        
+        # HONEYPOT: Log IOCTL request details
+        ctl_code = ioctlRequest['CtlCode']
+        smbServer.log(f"HONEYPOT: IOCTL request from {client_ip} - CtlCode: 0x{ctl_code:08x}", logging.DEBUG)
+        
         ioctls = smbServer.getIoctls()
         if ioctlRequest['CtlCode'] in ioctls:
             outputData, errorCode = ioctls[ioctlRequest['CtlCode']](connId, smbServer, ioctlRequest)
@@ -3862,6 +4059,11 @@ class SMB2Commands:
 
         respSMBCommand = smb2.SMB2Lock_Response()
 
+        # HONEYPOT: Log SMB2 lock
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 lock from {client_ip}", logging.INFO)
+        smbServer.log(f"HONEYPOT: LOCK request from {client_ip}", logging.DEBUG)
+
         # I'm actually doing nothing.. just make MacOS happy ;)
         errorCode = STATUS_SUCCESS
 
@@ -3870,13 +4072,26 @@ class SMB2Commands:
 
     @staticmethod
     def smb2Cancel(connId, smbServer, recvPacket):
+        # HONEYPOT: Log SMB2 cancel
+        connData = smbServer.getConnectionData(connId, checkStatus=False)
+        client_ip = connData.get('ClientIP', 'unknown')
+        smbServer.log(f"HONEYPOT: SMB2 cancel from {client_ip}", logging.INFO)
+        smbServer.log(f"HONEYPOT: CANCEL request from {client_ip}", logging.DEBUG)
+        
         # I'm actually doing nothing
         return [smb2.SMB2Error()], None, STATUS_CANCELLED
 
     @staticmethod
     def default(connId, smbServer, recvPacket):
+        # HONEYPOT: Log SMB2 unknown command
+        connData = smbServer.getConnectionData(connId, checkStatus=False)
+        client_ip = connData.get('ClientIP', 'unknown')
+        command = recvPacket['Command']
+        smbServer.log(f"HONEYPOT: SMB2 unknown command 0x{command:02x} from {client_ip}", logging.INFO)
+        smbServer.log(f"HONEYPOT: Unknown command 0x{command:02x} from {client_ip}", logging.WARNING)
+        
         # By default we return an SMB Packet with error not implemented
-        smbServer.log("Not implemented command: 0x%x" % recvPacket['Command'], logging.DEBUG)
+        smbServer.log("Not implemented command: 0x%x" % command, logging.DEBUG)
         return [smb2.SMB2Error()], None, STATUS_NOT_SUPPORTED
 
 
@@ -3940,6 +4155,8 @@ class SMBSERVERHandler(socketserver.BaseRequestHandler):
         socketserver.BaseRequestHandler.__init__(self, request, client_address, server)
 
     def handle(self):
+        # HONEYPOT: Log incoming connection
+        self.__SMB.log(f"HONEYPOT: Incoming connection from {self.__ip}:{self.__port} (ID: {self.__connId})", logging.INFO)
         self.__SMB.log("Incoming connection (%s,%d)" % (self.__ip, self.__port))
         self.__SMB.addConnection(self.__connId, self.__ip, self.__port)
         while True:
@@ -3959,6 +4176,10 @@ class SMBSERVERHandler(socketserver.BaseRequestHandler):
                     _, rn, my = p.get_trailer().split(b' ')
                     remote_name = nmb.decode_name(b'\x20' + rn)
                     myname = nmb.decode_name(b'\x20' + my)
+                    
+                    # HONEYPOT: Log NetBIOS session request
+                    self.__SMB.log(f"HONEYPOT: NetBIOS session request from {self.__ip} - Remote: {remote_name[1].strip()}, Local: {myname[1]}", logging.INFO)
+                    
                     self.__SMB.log(
                         "NetBIOS Session request (%s,%s,%s)" % (self.__ip, remote_name[1].strip(), myname[1]))
                     r = nmb.NetBIOSSessionPacket()
@@ -3966,6 +4187,9 @@ class SMBSERVERHandler(socketserver.BaseRequestHandler):
                     r.set_trailer(p.get_trailer())
                     self.__request.send(r.rawData())
                 else:
+                    # HONEYPOT: Log SMB request processing
+                    self.__SMB.log(f"HONEYPOT: Processing SMB request from {self.__ip}:{self.__port}", logging.DEBUG)
+                    
                     resp = self.__SMB.processRequest(self.__connId, p.get_trailer())
                     # Send all the packets received. Except for big transactions this should be
                     # a single packet
@@ -3975,6 +4199,8 @@ class SMBSERVERHandler(socketserver.BaseRequestHandler):
                         else:
                             session.send_packet(i)
             except Exception as e:
+                # HONEYPOT: Log connection errors
+                self.__SMB.log(f"HONEYPOT: Connection error from {self.__ip}:{self.__port} - {e}", logging.ERROR)
                 self.__SMB.log("Handle: %s" % e)
                 # import traceback
                 # traceback.print_exc()
@@ -3982,6 +4208,8 @@ class SMBSERVERHandler(socketserver.BaseRequestHandler):
 
     def finish(self):
         # Thread/process is dying, we should tell the main SMB thread to remove all this thread data
+        # HONEYPOT: Log connection closure
+        self.__SMB.log(f"HONEYPOT: Closing connection from {self.__ip}:{self.__port} (ID: {self.__connId})", logging.INFO)
         self.__SMB.log("Closing down connection (%s,%d)" % (self.__ip, self.__port))
         self.__SMB.removeConnection(self.__connId)
         return socketserver.BaseRequestHandler.finish(self)
@@ -4022,6 +4250,9 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
         # Allow anonymous logon
         self.__anonymousLogon = True
+        
+        # HONEYPOT: Log server startup
+        self.log("HONEYPOT: SMB Server starting with read-only enforcement", logging.INFO)
 
         self.auth_callback = None
 
@@ -4134,6 +4365,10 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
     def removeConnection(self, name):
         try:
+            # HONEYPOT: Log connection removal
+            if name in self.__activeConnections:
+                client_ip = self.__activeConnections[name].get('ClientIP', 'unknown')
+                self.log(f"HONEYPOT: Connection closed from {client_ip} (ID: {name})", logging.INFO)
             del (self.__activeConnections[name])
         except:
             pass
@@ -4157,6 +4392,9 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.__activeConnections[name]['SigningChallengeResponse'] = ''
         self.__activeConnections[name]['SigningSessionKey'] = b''
         self.__activeConnections[name]['Authenticated'] = False
+        
+        # HONEYPOT: Log new connection
+        self.log(f"HONEYPOT: New connection from {ip}:{port} (ID: {name})", logging.INFO)
 
     def getActiveConnections(self):
         return self.__activeConnections
@@ -4416,12 +4654,22 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
             connData = self.getConnectionData(connId, False)
             self.signSMBv2(packet, connData['SigningSessionKey'])
             isSMB2 = True
+            
+            # HONEYPOT: Log SMB2 packet
+            client_ip = connData.get('ClientIP', 'unknown')
+            self.log(f"HONEYPOT: SMB2 packet from {client_ip} - Command: 0x{packet['Command']:02x}, MessageID: {packet['MessageID']}", logging.DEBUG)
 
         connData = self.getConnectionData(connId, False)
 
         # We might have compound requests
         compoundedPacketsResponse = []
         compoundedPackets = []
+        
+        # HONEYPOT: Log compound request detection
+        if isSMB2 and packet.get('NextCommand', 0) != 0:
+            client_ip = connData.get('ClientIP', 'unknown')
+            self.log(f"HONEYPOT: Compound SMB2 request detected from {client_ip} - Command: 0x{packet['Command']:02x}", logging.INFO)
+        
         try:
             # Search out list of implemented commands
             # We provide them with:
@@ -4471,12 +4719,22 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                             if self.__SMB2Support is True:
                                 if packet['Command'] == smb.SMB.SMB_COM_NEGOTIATE:
                                     try:
+                                        # HONEYPOT: Log SMB2 negotiation attempt
+                                        client_ip = connData.get('ClientIP', 'unknown')
+                                        self.log(f'HONEYPOT: SMB2 negotiation attempt from {client_ip}', logging.INFO)
+                                        
                                         respCommands, respPackets, errorCode = self.__smb2Commands[smb2.SMB2_NEGOTIATE](
                                             connId, self, packet, True)
                                         isSMB2 = True
+                                        
+                                        # HONEYPOT: Log successful SMB2 negotiation
+                                        self.log(f'HONEYPOT: SMB2 negotiation successful from {client_ip}', logging.INFO)
                                     except Exception as e:
                                         import traceback
                                         traceback.print_exc()
+                                        # HONEYPOT: Log SMB2 negotiation failure
+                                        client_ip = connData.get('ClientIP', 'unknown')
+                                        self.log(f'HONEYPOT: SMB2 negotiation failed from {client_ip} - {e}', logging.ERROR)
                                         self.log('SMB2_NEGOTIATE: %s' % e, logging.ERROR)
                                         # If something went wrong, let's fallback to SMB1
                                         respCommands, respPackets, errorCode = self.__smbCommands[packet['Command']](
@@ -4518,22 +4776,44 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 else:
                     done = False
                     while not done:
+                        # HONEYPOT: Check if we have a custom hook for this command
                         if packet['Command'] in self.__smb2Commands:
                             if self.__SMB2Support is True:
-                                respCommands, respPackets, errorCode = self.__smb2Commands[packet['Command']](
-                                    connId,
-                                    self,
-                                    packet)
+                                # Check if this command has been hooked (custom handler)
+                                if packet['Command'] in self.__smb2Commands and hasattr(self.__smb2Commands[packet['Command']], '__name__'):
+                                    # This is a custom hook, call it directly
+                                    respCommands, respPackets, errorCode = self.__smb2Commands[packet['Command']](
+                                        connId,
+                                        self,
+                                        packet)
+                                    # HONEYPOT: Log hook execution
+                                    self.log(f"HONEYPOT: Custom hook executed for SMB2 command 0x{packet['Command']:02x}", logging.INFO)
+                                else:
+                                    # Default handler
+                                    respCommands, respPackets, errorCode = self.__smb2Commands[packet['Command']](
+                                        connId,
+                                        self,
+                                        packet)
+                                    # HONEYPOT: Log default handler execution
+                                    self.log(f"HONEYPOT: Default handler for SMB2 command 0x{packet['Command']:02x}", logging.DEBUG)
                             else:
                                 respCommands, respPackets, errorCode = self.__smb2Commands[255](connId, self, packet)
                         else:
                             respCommands, respPackets, errorCode = self.__smb2Commands[255](connId, self, packet)
+                            # HONEYPOT: Log unknown command
+                            self.log(f"HONEYPOT: Unknown SMB2 command 0x{packet['Command']:02x} - using default handler", logging.WARNING)
+                        
+                        # HONEYPOT: Log command processing result
+                        self.log(f"HONEYPOT: SMB2 command 0x{packet['Command']:02x} processed - Status: 0x{errorCode:08x}", logging.DEBUG)
+                        
                         # Let's store the result for this compounded packet
                         compoundedPacketsResponse.append((respCommands, respPackets, errorCode))
                         compoundedPackets.append(packet)
                         if packet['NextCommand'] != 0:
                             data = data[packet['NextCommand']:]
                             packet = smb2.SMB2Packet(data=data)
+                            # HONEYPOT: Log next compound command
+                            self.log(f"HONEYPOT: Next compound command: 0x{packet['Command']:02x}", logging.DEBUG)
                         else:
                             done = True
 
@@ -4541,7 +4821,11 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
             # import traceback
             # traceback.print_exc()
             # Something wen't wrong, defaulting to Bad user ID
-            self.log('processRequest (0x%x,%s)' % (packet['Command'], e), logging.ERROR)
+            # HONEYPOT: Log processing errors
+            client_ip = connData.get('ClientIP', 'unknown') if 'connData' in locals() else 'unknown'
+            command = packet.get('Command', 'unknown') if 'packet' in locals() else 'unknown'
+            self.log(f'HONEYPOT: Processing error from {client_ip} - Command: 0x{command:02x}, Error: {e}', logging.ERROR)
+            self.log('processRequest (0x%x,%s)' % (command, e), logging.ERROR)
             raise
 
         # We prepare the response packet to commands don't need to bother about that.
@@ -4622,6 +4906,10 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 packetsToSend = respPackets
 
         if isSMB2 is True:
+            # HONEYPOT: Log SMB2 response building
+            client_ip = connData.get('ClientIP', 'unknown')
+            self.log(f"HONEYPOT: Building SMB2 response for {client_ip} - {len(packetsToSend)} packets", logging.DEBUG)
+            
             # Let's build a compound answer and sign it
             finalData = []
             totalPackets = len(packetsToSend)
@@ -4639,9 +4927,22 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                     finalData.append(packet + padLen * b'\x00')
 
             packetsToSend = [b"".join(finalData)]
+            self.log(f"HONEYPOT: SMB2 response built - {len(finalData)} components, total size: {len(packetsToSend[0])}", logging.DEBUG)
+            
+            # HONEYPOT: Log response details
+            for idx, packet in enumerate(packetsToSend):
+                if hasattr(packet, 'getData'):
+                    command = packet.get('Command', 'unknown')
+                    status = packet.get('Status', 'unknown')
+                    self.log(f"HONEYPOT: Response packet {idx} - Command: 0x{command:02x}, Status: 0x{status:08x}", logging.DEBUG)
 
         # We clear the compound requests
         connData['LastRequest'] = {}
+
+        # HONEYPOT: Log final response
+        client_ip = connData.get('ClientIP', 'unknown')
+        total_packets = len(packetsToSend)
+        self.log(f"HONEYPOT: Sending {total_packets} response packets to {client_ip}", logging.DEBUG)
 
         return packetsToSend
 
@@ -4674,6 +4975,12 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
             self.__SMB2Support = self.__serverConfig.getboolean("global", "SMB2Support")
         else:
             self.__SMB2Support = False
+            
+        # HONEYPOT: Log SMB2 support status
+        if self.__SMB2Support:
+            self.log("HONEYPOT: SMB2 support enabled", logging.INFO)
+        else:
+            self.log("HONEYPOT: SMB2 support disabled", logging.INFO)
 
         if self.__serverConfig.has_option("global", "DropSSP"):
             self.__dropSSP = self.__serverConfig.getboolean("global", "DropSSP")
@@ -4926,11 +5233,17 @@ class SimpleSMBServer:
         return self.__server
 
     def start(self):
+        # HONEYPOT: Log server startup
+        self.log("HONEYPOT: Starting SMB honeypot server...", logging.INFO)
+        
         self.__srvsServer.start()
         self.__wkstServer.start()
         self.__server.serve_forever()
 
     def stop(self):
+        # HONEYPOT: Log server shutdown
+        self.log("HONEYPOT: Stopping SMB honeypot server...", logging.INFO)
+        
         self.__server.server_close()
 
     def registerNamedPipe(self, pipeName, address):
@@ -4953,8 +5266,14 @@ class SimpleSMBServer:
         self.__srvsServer.setServerConfig(self.__smbConfig)
         self.__server.processConfigFile()
         self.__srvsServer.processConfigFile()
+        
+        # HONEYPOT: Log share configuration
+        self.log(f"HONEYPOT: Share '{shareName.upper()}' configured - Path: {sharePath}, ReadOnly: {readOnly}", logging.INFO)
 
     def removeShare(self, shareName):
+        # HONEYPOT: Log share removal
+        self.log(f"HONEYPOT: Share '{shareName.upper()}' removed", logging.INFO)
+        
         self.__smbConfig.remove_section(shareName.upper())
         self.__server.setServerConfig(self.__smbConfig)
         self.__srvsServer.setServerConfig(self.__smbConfig)
