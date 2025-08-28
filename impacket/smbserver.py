@@ -4667,7 +4667,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
         compoundedPackets = []
         
         # HONEYPOT: Log compound request detection
-        if isSMB2 and packet.get('NextCommand', 0) != 0:
+        if isSMB2 and hasattr(packet, 'NextCommand') and packet['NextCommand'] != 0:
             client_ip = connData.get('ClientIP', 'unknown')
             self.log(f"HONEYPOT: Compound SMB2 request detected from {client_ip} - Command: 0x{packet['Command']:02x}", logging.INFO)
         
@@ -4824,7 +4824,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
             # Something wen't wrong, defaulting to Bad user ID
             # HONEYPOT: Log processing errors
             client_ip = connData.get('ClientIP', 'unknown') if 'connData' in locals() else 'unknown'
-            command = packet.get('Command', 'unknown') if 'packet' in locals() else 'unknown'
+            command = packet['Command'] if 'packet' in locals() and hasattr(packet, 'Command') else 'unknown'
             self.log(f'HONEYPOT: Processing error from {client_ip} - Command: 0x{command:02x}, Error: {e}', logging.ERROR)
             self.log('processRequest (0x%x,%s)' % (command, e), logging.ERROR)
             raise
@@ -4933,8 +4933,8 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
             # HONEYPOT: Log response details
             for idx, packet in enumerate(packetsToSend):
                 if hasattr(packet, 'getData'):
-                    command = packet.get('Command', 'unknown')
-                    status = packet.get('Status', 'unknown')
+                    command = packet['Command'] if hasattr(packet, 'Command') else 'unknown'
+                    status = packet['Status'] if hasattr(packet, 'Status') else 'unknown'
                     self.log(f"HONEYPOT: Response packet {idx} - Command: 0x{command:02x}, Status: 0x{status:08x}", logging.DEBUG)
 
         # We clear the compound requests
