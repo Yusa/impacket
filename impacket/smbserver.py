@@ -4087,8 +4087,9 @@ class SMB2Commands:
         connData = smbServer.getConnectionData(connId, checkStatus=False)
         client_ip = connData.get('ClientIP', 'unknown')
         command = recvPacket['Command']
-        smbServer.log(f"HONEYPOT: SMB2 unknown command 0x{command:02x} from {client_ip}", logging.INFO)
-        smbServer.log(f"HONEYPOT: Unknown command 0x{command:02x} from {client_ip}", logging.WARNING)
+        command_hex = f"0x{command:02x}" if isinstance(command, int) else str(command)
+        smbServer.log(f"HONEYPOT: SMB2 unknown command {command_hex} from {client_ip}", logging.INFO)
+        smbServer.log(f"HONEYPOT: Unknown command {command_hex} from {client_ip}", logging.WARNING)
         
         # By default we return an SMB Packet with error not implemented
         smbServer.log("Not implemented command: 0x%x" % command, logging.DEBUG)
@@ -4825,7 +4826,9 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
             # HONEYPOT: Log processing errors
             client_ip = connData.get('ClientIP', 'unknown') if 'connData' in locals() else 'unknown'
             command = packet['Command'] if 'packet' in locals() and hasattr(packet, 'Command') else 'unknown'
-            self.log(f'HONEYPOT: Processing error from {client_ip} - Command: 0x{command:02x}, Error: {e}', logging.ERROR)
+            # Convert command to hex string safely
+            command_hex = f"0x{command:02x}" if isinstance(command, int) else str(command)
+            self.log(f'HONEYPOT: Processing error from {client_ip} - Command: {command_hex}, Error: {e}', logging.ERROR)
             self.log('processRequest (0x%x,%s)' % (command, e), logging.ERROR)
             raise
 
@@ -4935,7 +4938,10 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 if hasattr(packet, 'getData'):
                     command = packet['Command'] if hasattr(packet, 'Command') else 'unknown'
                     status = packet['Status'] if hasattr(packet, 'Status') else 'unknown'
-                    self.log(f"HONEYPOT: Response packet {idx} - Command: 0x{command:02x}, Status: 0x{status:08x}", logging.DEBUG)
+                    # Convert to hex strings safely
+                    command_hex = f"0x{command:02x}" if isinstance(command, int) else str(command)
+                    status_hex = f"0x{status:08x}" if isinstance(status, int) else str(status)
+                    self.log(f"HONEYPOT: Response packet {idx} - Command: {command_hex}, Status: {status_hex}", logging.DEBUG)
 
         # We clear the compound requests
         connData['LastRequest'] = {}
