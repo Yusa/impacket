@@ -3255,6 +3255,7 @@ class SMB2Commands:
                     # Special case: Allow IPC$ service creation for smbutil compatibility
                     # Access mask 0xc0000000 is GENERIC_READ | GENERIC_WRITE for IPC services
                     if fileName == 'srvsvc' and desiredAccess == 0xc0000000:
+                        client_ip = connData.get('ClientIP', 'unknown')
                         smbServer.log(f"HONEYPOT: ALLOWING IPC$ service creation for {fileName} from {client_ip}", logging.INFO)
                         return None  # Let impacket handle this normally
                     
