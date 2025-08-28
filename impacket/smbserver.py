@@ -3257,7 +3257,8 @@ class SMB2Commands:
                     if fileName == 'srvsvc' and desiredAccess == 0xc0000000:
                         client_ip = connData.get('ClientIP', 'unknown')
                         smbServer.log(f"HONEYPOT: ALLOWING IPC$ service creation for {fileName} from {client_ip}", logging.INFO)
-                        return None  # Let impacket handle this normally
+                        # Don't return None - let the code continue to process normally
+                        # This allows impacket to handle the IPC$ service creation
                     
                     if has_write_access:
                         # HONEYPOT: Log blocked write attempt
