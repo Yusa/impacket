@@ -4977,11 +4977,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
         else:
             self.__SMB2Support = False
             
-        # HONEYPOT: Log SMB2 support status
-        if self.__SMB2Support:
-            self.log("HONEYPOT: SMB2 support enabled", logging.INFO)
-        else:
-            self.log("HONEYPOT: SMB2 support disabled", logging.INFO)
+        # HONEYPOT: SMB2 support status will be logged after logger initialization
 
         if self.__serverConfig.has_option("global", "DropSSP"):
             self.__dropSSP = self.__serverConfig.getboolean("global", "DropSSP")
@@ -5003,6 +4999,12 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
         # HONEYPOT: Log server startup after logger is initialized
         self.log("HONEYPOT: SMB Server initialized with read-only enforcement", logging.INFO)
+        
+        # HONEYPOT: Log SMB2 support status
+        if self.__SMB2Support:
+            self.log("HONEYPOT: SMB2 support enabled", logging.INFO)
+        else:
+            self.log("HONEYPOT: SMB2 support disabled", logging.INFO)
 
         # Process the credentials
         credentials_fname = self.__serverConfig.get('global', 'credentials_file')
@@ -5235,6 +5237,14 @@ class SimpleSMBServer:
 
     def getServer(self):
         return self.__server
+    
+    def log(self, msg, level=logging.INFO):
+        """Safe logging method for SimpleSMBServer"""
+        if hasattr(self.__server, 'log') and hasattr(self.__server, '_SMBSERVER__log') and self.__server._SMBSERVER__log:
+            self.__server.log(msg, level)
+        else:
+            # Fallback to module logger if server logger is not ready
+            LOG.log(level, msg)
 
     def start(self):
         # HONEYPOT: Log server startup
