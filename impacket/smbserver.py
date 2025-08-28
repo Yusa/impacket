@@ -3247,7 +3247,7 @@ class SMB2Commands:
                         (desiredAccess & smb2.GENERIC_ALL) or
                         (desiredAccess & smb2.FILE_APPEND_DATA) or
                         (desiredAccess & smb2.FILE_DELETE_CHILD) or
-                        (desiredAccess & smb2.FILE_DELETE) or
+                        (desiredAccess & smb2.DELETE) or
                         (desiredAccess & smb2.FILE_WRITE_ATTRIBUTES) or
                         (desiredAccess & smb2.FILE_WRITE_EA)
                     )
