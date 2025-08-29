@@ -3206,6 +3206,29 @@ class SMB2Commands:
             
             smbServer.log(f"HONEYPOT: CREATE request from {client_ip} - File: {fileName}, Access: 0x{desired_access:08x}, Disposition: {create_disposition}, Options: 0x{create_options:08x}", logging.INFO)
 
+            # HONEYPOT: SECURITY - Block file access in IPC$ share while allowing named pipes
+            share_name = None
+            if recvPacket['TreeID'] in connData['ConnectedShares']:
+                share_info = connData['ConnectedShares'][recvPacket['TreeID']]
+                share_name = share_info.get('share', '')
+            
+            if share_name == 'IPC$':
+                # Check if this is a named pipe operation (srvsvc, wkssvc, etc.)
+                is_named_pipe = (
+                    fileName == 'srvsvc' or 
+                    fileName == 'wkssvc' or
+                    fileName.startswith('\\PIPE\\') or
+                    fileName.startswith('PIPE\\')
+                )
+                
+                if is_named_pipe:
+                    # Allow named pipe operations for IPC$ services
+                    smbServer.log(f"HONEYPOT: ALLOWING IPC$ named pipe operation: {fileName} from {client_ip}", logging.INFO)
+                else:
+                    # Block all file access in IPC$ share for security
+                    smbServer.log(f"HONEYPOT: BLOCKED FILE ACCESS in IPC$ share from {client_ip} - File: {fileName}", logging.WARNING)
+                    return [smb2.SMB2Error()], None, STATUS_ACCESS_DENIED
+
             if not isInFileJail(path, fileName):
                 LOG.error("Path not in current working directory")
                 return [smb2.SMB2Error()], None, STATUS_OBJECT_PATH_SYNTAX_BAD
