@@ -5381,7 +5381,6 @@ class SimpleSMBServer:
             
             try:
                 import os
-                import tempfile
                 
                 # Create a secure IPC$ directory structure
                 secure_ipc_dir = path
@@ -5397,12 +5396,6 @@ class SimpleSMBServer:
                 os.chmod(secure_ipc_dir, 0o555)  # Read-only for all users
                 os.chmod(honeypot_marker, 0o444)  # Read-only for all users
                 
-                # Create named pipe compatibility structure
-                # This allows srvsvc and wkssvc to work while maintaining security
-                named_pipe_dir = os.path.join(secure_ipc_dir, 'named_pipes')
-                if not os.path.exists(named_pipe_dir):
-                    os.makedirs(named_pipe_dir, mode=0o555, exist_ok=True)
-                
                 # Create a README file explaining the security model
                 readme_file = os.path.join(secure_ipc_dir, 'README.txt')
                 with open(readme_file, 'w') as f:
@@ -5414,7 +5407,9 @@ class SimpleSMBServer:
                 
                 os.chmod(readme_file, 0o444)  # Read-only for all users
                 
-                # Update the IPC$ configuration to point to the secure directory
+                # CRITICAL: Update the IPC$ configuration to point to the secure directory
+                # The named pipes (srvsvc, wkssvc) will continue working because they are
+                # registered at the SMB server level, NOT tied to the IPC$ filesystem path
                 self.__smbConfig.set('IPC$', 'path', secure_ipc_dir)
                 self.__smbConfig.set('IPC$', 'comment', comment)
                 
@@ -5426,7 +5421,7 @@ class SimpleSMBServer:
                 
                 self.log(f"HONEYPOT: Created secure IPC$ environment at: {secure_ipc_dir}", logging.INFO)
                 self.log(f"HONEYPOT: Updated IPC$ share to point to secure directory: {secure_ipc_dir}", logging.INFO)
-                self.log(f"HONEYPOT: Named pipe compatibility structure created", logging.INFO)
+                self.log(f"HONEYPOT: Named pipes (srvsvc, wkssvc) will continue working at server level", logging.INFO)
                 self.log(f"HONEYPOT: Project file exposure blocked - security achieved", logging.INFO)
                 
             except Exception as e:
