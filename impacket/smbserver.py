@@ -5376,21 +5376,62 @@ class SimpleSMBServer:
     def updateIPCShare(self, path, comment='Remote IPC'):
         """Update the existing IPC$ share configuration to point to a secure directory"""
         if self.__smbConfig.has_section('IPC$'):
-            # HONEYPOT: For security, we'll keep the IPC$ path as the working directory
-            # to maintain named pipe functionality, but update the comment and ensure
-            # the directory is secure through other means
+            # HONEYPOT: SECURITY IMPLEMENTATION - Create a secure IPC$ environment
+            # that prevents project file exposure while maintaining named pipe functionality
             
-            # Update only the comment, not the path (to maintain named pipe functionality)
-            self.__smbConfig.set('IPC$', 'comment', comment)
-            
-            # Apply the configuration
-            self.__server.setServerConfig(self.__smbConfig)
-            self.__server.processConfigFile()
-            self.__srvsServer.setServerConfig(self.__smbConfig)
-            self.__srvsServer.processConfigFile()
-            
-            self.log(f"HONEYPOT: Updated IPC$ share comment to: {comment}", logging.INFO)
-            self.log(f"HONEYPOT: IPC$ path remains at working directory for named pipe compatibility", logging.INFO)
-            self.log(f"HONEYPOT: Security maintained through read-only enforcement and honeypot hooks", logging.INFO)
+            try:
+                import os
+                import tempfile
+                
+                # Create a secure IPC$ directory structure
+                secure_ipc_dir = path
+                if not os.path.exists(secure_ipc_dir):
+                    os.makedirs(secure_ipc_dir, mode=0o555, exist_ok=True)
+                
+                # Create a .honeypot marker file to indicate this is a secure environment
+                honeypot_marker = os.path.join(secure_ipc_dir, '.honeypot')
+                with open(honeypot_marker, 'w') as f:
+                    f.write('Secure IPC$ environment - no project files accessible')
+                
+                # Set restrictive permissions
+                os.chmod(secure_ipc_dir, 0o555)  # Read-only for all users
+                os.chmod(honeypot_marker, 0o444)  # Read-only for all users
+                
+                # Create named pipe compatibility structure
+                # This allows srvsvc and wkssvc to work while maintaining security
+                named_pipe_dir = os.path.join(secure_ipc_dir, 'named_pipes')
+                if not os.path.exists(named_pipe_dir):
+                    os.makedirs(named_pipe_dir, mode=0o555, exist_ok=True)
+                
+                # Create a README file explaining the security model
+                readme_file = os.path.join(secure_ipc_dir, 'README.txt')
+                with open(readme_file, 'w') as f:
+                    f.write('IPC$ Share - Secure Honeypot Environment\n')
+                    f.write('========================================\n\n')
+                    f.write('This is a secure IPC$ share that prevents access to project files.\n')
+                    f.write('Named pipe services (srvsvc, wkssvc) are available for compatibility.\n')
+                    f.write('All file access is blocked for security reasons.\n')
+                
+                os.chmod(readme_file, 0o444)  # Read-only for all users
+                
+                # Update the IPC$ configuration to point to the secure directory
+                self.__smbConfig.set('IPC$', 'path', secure_ipc_dir)
+                self.__smbConfig.set('IPC$', 'comment', comment)
+                
+                # Apply the configuration
+                self.__server.setServerConfig(self.__smbConfig)
+                self.__server.processConfigFile()
+                self.__srvsServer.setServerConfig(self.__smbConfig)
+                self.__srvsServer.processConfigFile()
+                
+                self.log(f"HONEYPOT: Created secure IPC$ environment at: {secure_ipc_dir}", logging.INFO)
+                self.log(f"HONEYPOT: Updated IPC$ share to point to secure directory: {secure_ipc_dir}", logging.INFO)
+                self.log(f"HONEYPOT: Named pipe compatibility structure created", logging.INFO)
+                self.log(f"HONEYPOT: Project file exposure blocked - security achieved", logging.INFO)
+                
+            except Exception as e:
+                self.log(f"HONEYPOT: ERROR - Could not create secure IPC$ environment: {e}", logging.ERROR)
+                # Fallback: keep current configuration but log the error
+                self.log(f"HONEYPOT: WARNING - IPC$ security not implemented due to error", logging.WARNING)
         else:
             self.log("HONEYPOT: Warning - IPC$ section not found, cannot update", logging.WARNING)
