@@ -3211,12 +3211,20 @@ class SMB2Commands:
 
             # HONEYPOT: SECURITY - Block file access in IPC$ share while allowing named pipes
             share_name = None
-            if recvPacket['TreeID'] in connData['ConnectedShares']:
+            
+            # DEBUG: Check what's in connData and recvPacket
+            smbServer.log(f"HONEYPOT: DEBUG - connData keys: {list(connData.keys()) if connData else 'None'}", logging.INFO)
+            smbServer.log(f"HONEYPOT: DEBUG - recvPacket TreeID: {recvPacket.get('TreeID', 'None')}", logging.INFO)
+            
+            if 'ConnectedShares' in connData and recvPacket['TreeID'] in connData['ConnectedShares']:
                 share_info = connData['ConnectedShares'][recvPacket['TreeID']]
                 share_name = share_info.get('share', '')
+                smbServer.log(f"HONEYPOT: DEBUG - Found share info: {share_info}", logging.INFO)
+            else:
+                smbServer.log(f"HONEYPOT: DEBUG - No ConnectedShares or TreeID not found", logging.INFO)
             
             # DEBUG: Log what we're processing
-            smbServer.log(f"HONEYPOT: DEBUG - Processing CREATE for file: {fileName}, share: {share_name}, TreeID: {recvPacket['TreeID']}", logging.DEBUG)
+            smbServer.log(f"HONEYPOT: DEBUG - Processing CREATE for file: {fileName}, share: {share_name}, TreeID: {recvPacket['TreeID']}", logging.INFO)
             
             if share_name == 'IPC$':
                 smbServer.log(f"HONEYPOT: DEBUG - Entered IPC$ logic for file: {fileName}", logging.DEBUG)
