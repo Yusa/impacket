@@ -3212,7 +3212,12 @@ class SMB2Commands:
                 share_info = connData['ConnectedShares'][recvPacket['TreeID']]
                 share_name = share_info.get('share', '')
             
+            # DEBUG: Log what we're processing
+            smbServer.log(f"HONEYPOT: DEBUG - Processing CREATE for file: {fileName}, share: {share_name}, TreeID: {recvPacket['TreeID']}", logging.DEBUG)
+            
             if share_name == 'IPC$':
+                smbServer.log(f"HONEYPOT: DEBUG - Entered IPC$ logic for file: {fileName}", logging.DEBUG)
+                
                 # Check if this is a named pipe operation (srvsvc, wkssvc, etc.)
                 is_named_pipe = (
                     fileName == 'srvsvc' or 
@@ -3220,6 +3225,8 @@ class SMB2Commands:
                     fileName.startswith('\\PIPE\\') or
                     fileName.startswith('PIPE\\')
                 )
+                
+                smbServer.log(f"HONEYPOT: DEBUG - is_named_pipe check result: {is_named_pipe} for {fileName}", logging.DEBUG)
                 
                 if is_named_pipe:
                     # HONEYPOT: Handle virtual named pipe creation for IPC$ services
