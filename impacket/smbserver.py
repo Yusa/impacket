@@ -5045,6 +5045,38 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 pass
         self.__credentials[name.lower()] = (uid, lmhash, nthash)
 
+    def updateIPCShare(self, path, comment='Remote IPC'):
+        """Update the existing IPC$ share configuration to point to a secure directory"""
+        if self.__smbConfig.has_section('IPC$'):
+            # Store the original IPC$ path for named pipe compatibility
+            original_path = self.__smbConfig.get('IPC$', 'path')
+            
+            # Update the IPC$ configuration
+            self.__smbConfig.set('IPC$', 'path', path)
+            self.__smbConfig.set('IPC$', 'comment', comment)
+            
+            # Apply the configuration
+            self.__server.setServerConfig(self.__smbConfig)
+            self.__server.processConfigFile()
+            self.__srvsServer.setServerConfig(self.__smbConfig)
+            self.__srvsServer.processConfigFile()
+            
+            # HONEYPOT: Ensure named pipes still work by creating a symbolic link
+            # This allows the srvsvc and wkssvc services to be accessible
+            try:
+                import os
+                # Create a symbolic link from the new IPC$ path to the original path for named pipes
+                named_pipe_link = os.path.join(path, 'named_pipes')
+                if not os.path.exists(named_pipe_link):
+                    os.symlink(original_path, named_pipe_link)
+                    self.log(f"HONEYPOT: Created named pipe compatibility link: {named_pipe_link} -> {original_path}", logging.INFO)
+            except Exception as e:
+                self.log(f"HONEYPOT: Warning - Could not create named pipe compatibility link: {e}", logging.WARNING)
+            
+            self.log(f"HONEYPOT: Updated IPC$ share to point to secure directory: {path}", logging.INFO)
+        else:
+            self.log("HONEYPOT: Warning - IPC$ section not found, cannot update", logging.WARNING)
+
 
 # For windows platforms, opening a directory is not an option, so we set a void FD
 VOID_FILE_DESCRIPTOR = -1
@@ -5347,16 +5379,3 @@ class SimpleSMBServer:
             self.__smbConfig.set("global", "DropSSP", "False")
         self.__server.setServerConfig(self.__smbConfig)
         self.__server.processConfigFile()
-
-    def updateIPCShare(self, path, comment='Remote IPC'):
-        """Update the existing IPC$ share configuration to point to a secure directory"""
-        if self.__smbConfig.has_section('IPC$'):
-            self.__smbConfig.set('IPC$', 'path', path)
-            self.__smbConfig.set('IPC$', 'comment', comment)
-            self.__server.setServerConfig(self.__smbConfig)
-            self.__server.processConfigFile()
-            self.__srvsServer.setServerConfig(self.__smbConfig)
-            self.__srvsServer.processConfigFile()
-            self.log(f"HONEYPOT: Updated IPC$ share to point to secure directory: {path}", logging.INFO)
-        else:
-            self.log("HONEYPOT: Warning - IPC$ section not found, cannot update", logging.WARNING)
