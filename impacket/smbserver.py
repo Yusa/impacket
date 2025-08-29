@@ -5370,6 +5370,10 @@ class SimpleSMBServer:
             # This allows the srvsvc and wkssvc services to be accessible
             try:
                 import os
+                # If original path is empty, use current working directory as fallback
+                if not original_path or original_path == '':
+                    original_path = os.getcwd()
+                
                 # Create a symbolic link from the new IPC$ path to the original path for named pipes
                 named_pipe_link = os.path.join(path, 'named_pipes')
                 if not os.path.exists(named_pipe_link):
