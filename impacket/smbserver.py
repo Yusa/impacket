@@ -3199,6 +3199,9 @@ class SMB2Commands:
             client_ip = connData.get('ClientIP', 'unknown')
             smbServer.log(f"HONEYPOT: SMB2 create from {client_ip}", logging.INFO)
             
+            # DEBUG: Simple test to verify our code is being executed
+            smbServer.log(f"HONEYPOT: DEBUG TEST - CREATE handler is working for file: {fileName}", logging.INFO)
+            
             # HONEYPOT: Log CREATE request details
             desired_access = ntCreateRequest['DesiredAccess']
             create_disposition = ntCreateRequest['CreateDisposition']
