@@ -5347,3 +5347,16 @@ class SimpleSMBServer:
             self.__smbConfig.set("global", "DropSSP", "False")
         self.__server.setServerConfig(self.__smbConfig)
         self.__server.processConfigFile()
+
+    def updateIPCShare(self, path, comment='Remote IPC'):
+        """Update the existing IPC$ share configuration to point to a secure directory"""
+        if self.__smbConfig.has_section('IPC$'):
+            self.__smbConfig.set('IPC$', 'path', path)
+            self.__smbConfig.set('IPC$', 'comment', comment)
+            self.__server.setServerConfig(self.__smbConfig)
+            self.__server.processConfigFile()
+            self.__srvsServer.setServerConfig(self.__smbConfig)
+            self.__srvsServer.processConfigFile()
+            self.log(f"HONEYPOT: Updated IPC$ share to point to secure directory: {path}", logging.INFO)
+        else:
+            self.log("HONEYPOT: Warning - IPC$ section not found, cannot update", logging.WARNING)
