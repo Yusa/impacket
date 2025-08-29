@@ -3214,7 +3214,7 @@ class SMB2Commands:
             
             # DEBUG: Check what's in connData and recvPacket
             smbServer.log(f"HONEYPOT: DEBUG - connData keys: {list(connData.keys()) if connData else 'None'}", logging.INFO)
-            smbServer.log(f"HONEYPOT: DEBUG - recvPacket TreeID: {recvPacket.get('TreeID', 'None')}", logging.INFO)
+            smbServer.log(f"HONEYPOT: DEBUG - recvPacket TreeID: {recvPacket['TreeID'] if 'TreeID' in recvPacket else 'None'}", logging.INFO)
             
             if 'ConnectedShares' in connData and recvPacket['TreeID'] in connData['ConnectedShares']:
                 share_info = connData['ConnectedShares'][recvPacket['TreeID']]
