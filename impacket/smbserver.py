@@ -3222,14 +3222,46 @@ class SMB2Commands:
                 )
                 
                 if is_named_pipe:
-                    # Allow named pipe operations for IPC$ services
-                    smbServer.log(f"HONEYPOT: ALLOWING IPC$ named pipe operation: {fileName} from {client_ip}", logging.INFO)
+                    # HONEYPOT: Handle virtual named pipe creation for IPC$ services
+                    # This allows smbutil view to work while maintaining security
+                    smbServer.log(f"HONEYPOT: HANDLING VIRTUAL IPC$ named pipe: {fileName} from {client_ip}", logging.INFO)
+                    
+                    # Create a virtual file handle for the named pipe
+                    # This bypasses filesystem access and uses the registered named pipe
+                    virtual_file_id = f"VIRTUAL_PIPE_{fileName}_{connId}"
+                    
+                    # Store virtual file info in connection data
+                    if 'virtual_files' not in connData:
+                        connData['virtual_files'] = {}
+                    connData['virtual_files'][virtual_file_id] = {
+                        'type': 'named_pipe',
+                        'name': fileName,
+                        'share': 'IPC$'
+                    }
+                    
+                    # Set the file ID in the response
+                    respSMBCommand['FileID'] = virtual_file_id.encode('utf-8')
+                    
+                    # Log successful virtual named pipe creation
+                    smbServer.log(f"HONEYPOT: Virtual named pipe created: {fileName} -> {virtual_file_id}", logging.INFO)
+                    
+                    # Return success immediately - no filesystem access needed
+                    # CRITICAL: Set connection data and return immediately to avoid conflicts
+                    smbServer.setConnectionData(connId, connData)
+                    smbServer.log(f"HONEYPOT: Virtual named pipe creation completed successfully for {fileName}", logging.INFO)
+                    return [respSMBCommand], None, STATUS_SUCCESS
                 else:
                     # Block all file access in IPC$ share for security
                     smbServer.log(f"HONEYPOT: BLOCKED FILE ACCESS in IPC$ share from {client_ip} - File: {fileName}", logging.WARNING)
                     return [smb2.SMB2Error()], None, STATUS_ACCESS_DENIED
 
-            if not isInFileJail(path, fileName):
+            # HONEYPOT: Skip filesystem logic if we've already handled a virtual named pipe
+            # This prevents conflicts between virtual named pipe handling and filesystem access
+            if share_name == 'IPC$' and fileName in ['srvsvc', 'wkssvc']:
+                smbServer.log(f"HONEYPOT: Skipping filesystem logic for virtual named pipe: {fileName}", logging.INFO)
+                # We've already handled this in the IPC$ logic above, so just continue
+                pass
+            elif not isInFileJail(path, fileName):
                 LOG.error("Path not in current working directory")
                 return [smb2.SMB2Error()], None, STATUS_OBJECT_PATH_SYNTAX_BAD
 
