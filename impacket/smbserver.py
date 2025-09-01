@@ -4258,131 +4258,147 @@ class Ioctls:
 
     @staticmethod
     def fsctlPipeTransceive(connId, smbServer, ioctlRequest):
+        """
+        Handle FSCTL_PIPE_TRANSCEIVE for named pipes
+        This is used for RPC communication over named pipes like srvsvc for share enumeration
+        """
         connData = smbServer.getConnectionData(connId)
         client_ip = connData.get('ClientIP', 'unknown')
         
         smbServer.log(f"HONEYPOT: fsctlPipeTransceive called for {client_ip} - CtlCode: 0x{ioctlRequest['CtlCode']:08x}", logging.INFO)
 
-        ioctlResponse = ''
+        try:
+            # Get the buffer data from the IOCTL request
+            buffer_data = ioctlRequest['Buffer']
+            smbServer.log(f"HONEYPOT: fsctlPipeTransceive - Buffer length: {len(buffer_data)}", logging.INFO)
+            
+            # Check if this is a DCERPC request
+            if len(buffer_data) >= 72 and buffer_data[0] == 5 and buffer_data[1] == 0:  # DCERPC version 5.0
+                dcerpc_type = buffer_data[2]
+                smbServer.log(f"HONEYPOT: DCERPC request detected from {client_ip} - type: {dcerpc_type}", logging.INFO)
+                
+                if dcerpc_type == 11:  # BIND request
+                    smbServer.log(f"HONEYPOT: DCERPC BIND request detected from {client_ip}", logging.INFO)
+                    
+                    # Craft a DCERPC BIND_ACK response
+                    bind_ack_response = Ioctls._craft_dcerpc_bind_ack()
+                    smbServer.log(f"HONEYPOT: Returning DCERPC BIND_ACK response for {client_ip} - length: {len(bind_ack_response)}", logging.INFO)
+                    return bind_ack_response, STATUS_SUCCESS
+                
+                elif dcerpc_type == 0:  # REQUEST
+                    # Check if this is a NetShareEnumAll request (opnum 15)
+                    if len(buffer_data) >= 100:
+                        # Look for opnum 15 in the DCERPC request
+                        opnum_offset = 24  # Typical position of opnum in DCERPC request
+                        if opnum_offset < len(buffer_data) and buffer_data[opnum_offset] == 15:
+                            smbServer.log(f"HONEYPOT: NetShareEnumAll request detected from {client_ip}", logging.INFO)
+                            
+                            # Craft a NetShareEnumAll response with our honeypot shares
+                            share_enum_response = Ioctls._craft_net_share_enum_all_response()
+                            smbServer.log(f"HONEYPOT: Returning NetShareEnumAll response for {client_ip} - length: {len(share_enum_response)}", logging.INFO)
+                            return share_enum_response, STATUS_SUCCESS
+            
+            # For other RPC calls or unrecognized requests, return a default response
+            smbServer.log(f"HONEYPOT: Default pipe transceive for {client_ip} - returning empty response", logging.DEBUG)
+            return b'\x00' * 64, STATUS_SUCCESS
+            
+        except Exception as e:
+            smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
+            return b'\x00' * 64, STATUS_SUCCESS
 
-        smbServer.log(f"HONEYPOT: fsctlPipeTransceive - FileID: {ioctlRequest['FileID'].getData().hex()}", logging.DEBUG)
-        smbServer.log(f"HONEYPOT: fsctlPipeTransceive - OpenedFiles keys: {list(connData['OpenedFiles'].keys())}", logging.DEBUG)
+    @staticmethod
+    def _craft_dcerpc_bind_ack():
+        """
+        Craft a DCERPC BIND_ACK response
+        This is a minimal response that should satisfy the client's binding request
+        """
+        # DCERPC BIND_ACK response structure
+        # Based on the working traffic analysis
+        response = bytearray()
         
-        if ioctlRequest['FileID'].getData() in connData['OpenedFiles']:
-            fileHandle = connData['OpenedFiles'][ioctlRequest['FileID'].getData()]['FileHandle']
-            smbServer.log(f"HONEYPOT: fsctlPipeTransceive - Found file handle: {fileHandle}", logging.DEBUG)
-            errorCode = STATUS_SUCCESS
-            try:
-                if fileHandle != PIPE_FILE_DESCRIPTOR:
-                    smbServer.log(f"HONEYPOT: fsctlPipeTransceive - Invalid file handle type: {fileHandle}", logging.DEBUG)
-                    errorCode = STATUS_INVALID_DEVICE_REQUEST
-                else:
-                    # HONEYPOT: Handle RPC calls through named pipes for share enumeration
-                    smbServer.log(f"HONEYPOT: Pipe transceive from {client_ip} - Buffer length: {len(ioctlRequest['Buffer'])}", logging.DEBUG)
-                    
-                    # CRITICAL FIX: Check for share enumeration FIRST, before handling virtual named pipes
-                    # This ensures share enumeration requests get proper responses
-                    buffer_data = ioctlRequest['Buffer']
-                    smbServer.log(f"HONEYPOT: Buffer data preview: {buffer_data[:100].hex()}", logging.DEBUG)
-                    smbServer.log(f"HONEYPOT: Buffer data as string: {buffer_data[:100]}", logging.DEBUG)
-                    smbServer.log(f"HONEYPOT: Buffer data length: {len(buffer_data)}", logging.DEBUG)
-                    
-                    # Simple heuristic: if it contains "srvsvc" or "wkssvc" related data, it's likely share enumeration
-                    has_srvsvc = b'srvsvc' in buffer_data.lower()
-                    has_wkssvc = b'wkssvc' in buffer_data.lower()
-                    smbServer.log(f"HONEYPOT: Buffer check - has_srvsvc: {has_srvsvc}, has_wkssvc: {has_wkssvc}", logging.DEBUG)
-                    
-                    # Additional debugging: check for any recognizable patterns
-                    smbServer.log(f"HONEYPOT: Buffer contains 'srvsvc' (case-insensitive): {b'srvsvc' in buffer_data.lower()}", logging.DEBUG)
-                    smbServer.log(f"HONEYPOT: Buffer contains 'wkssvc' (case-insensitive): {b'wkssvc' in buffer_data.lower()}", logging.DEBUG)
-                    
-                    if has_srvsvc or has_wkssvc:
-                        smbServer.log(f"HONEYPOT: Share enumeration RPC detected from {client_ip}", logging.INFO)
-                        
-                        # Create a proper RPC response for share enumeration
-                        # This follows the MS-RPCE (RPC over SMB) specification
-                        
-                        # RPC Header (20 bytes)
-                        rpc_response = b''
-                        rpc_response += b'\x05\x00'  # RPC version (5.0)
-                        rpc_response += b'\x00\x00'  # RPC version minor (0.0)
-                        rpc_response += b'\x03'      # Packet type (3 = response)
-                        rpc_response += b'\x00'      # Flags1
-                        rpc_response += b'\x00'      # Flags2
-                        rpc_response += b'\x00\x00'  # Data representation (little-endian, ASCII, IEEE)
-                        rpc_response += b'\x00\x00'  # Frag length (will be set below)
-                        rpc_response += b'\x00\x00'  # Auth length
-                        rpc_response += b'\x00\x00\x00\x00'  # Call ID
-                        
-                        # RPC Response Body
-                        # NetrShareEnum response structure
-                        response_body = b''
-                        response_body += b'\x00\x00\x00\x00'  # Status (0 = success)
-                        response_body += b'\x02\x00\x00\x00'  # Number of shares
-                        
-                        # PUBLIC share entry
-                        share_name = b'PUBLIC'
-                        share_name_padded = share_name + b'\x00' * (16 - len(share_name))  # Pad to 16 bytes
-                        share_type = b'\x00\x00\x00\x00'  # STYPE_DISKTREE (disk share)
-                        share_comment = b'Public Share'
-                        share_comment_padded = share_comment + b'\x00' * (48 - len(share_comment))  # Pad to 48 bytes
-                        
-                        response_body += share_name_padded + share_type + share_comment_padded
-                        
-                        # IPC$ share entry
-                        share_name2 = b'IPC$'
-                        share_name2_padded = share_name2 + b'\x00' * (16 - len(share_name2))  # Pad to 16 bytes
-                        share_type2 = b'\x03\x00\x00\x00'  # STYPE_IPC (IPC share)
-                        share_comment2 = b'Remote IPC'
-                        share_comment2_padded = share_comment2 + b'\x00' * (48 - len(share_comment2))  # Pad to 48 bytes
-                        
-                        response_body += share_name2_padded + share_type2 + share_comment2_padded
-                        
-                        # Set the fragment length in the RPC header
-                        total_length = len(rpc_response) + len(response_body)
-                        rpc_response = rpc_response[:6] + struct.pack('<H', total_length) + rpc_response[8:]
-                        
-                        # Combine header and body
-                        rpc_response += response_body
-                        
-                        smbServer.log(f"HONEYPOT: Share enumeration RPC response created for {client_ip} - 2 shares, total length: {len(rpc_response)}", logging.INFO)
-                        ioctlResponse = rpc_response
-                        
-                    else:
-                        # Default pipe behavior for other RPC calls
-                        smbServer.log(f"HONEYPOT: Default pipe transceive for {client_ip}", logging.DEBUG)
-                        
-                        # Check if this is a virtual named pipe (our honeypot pipes don't have real sockets)
-                        file_id = ioctlRequest['FileID'].getData()
-                        if file_id in connData['OpenedFiles'] and connData['OpenedFiles'][file_id].get('VirtualPipe', False):
-                            smbServer.log(f"HONEYPOT: Virtual named pipe IOCTL for {client_ip} - pipe: {connData['OpenedFiles'][file_id].get('PipeName', 'unknown')}", logging.INFO)
-                            # For virtual named pipes, return a default response
-                            # This prevents the 'Socket' error
-                            ioctlResponse = b'\x00' * 64  # Default empty response
-                        else:
-                            # Real named pipe with socket
-                            sock = connData['OpenedFiles'][ioctlRequest['FileID'].getData()]['Socket']
-                            sock.sendall(ioctlRequest['Buffer'])
-                            ioctlResponse = sock.recv(ioctlRequest['MaxOutputResponse'])
-                        
-            except Exception as e:
-                smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
-                errorCode = STATUS_ACCESS_DENIED
-        else:
-            errorCode = STATUS_INVALID_DEVICE_REQUEST
+        # DCERPC Header
+        response.extend(b'\x05\x00')  # Version 5.0
+        response.extend(b'\x0c')      # Packet type: BIND_ACK (12)
+        response.extend(b'\x03')      # Flags: first + last fragment
+        response.extend(b'\x10\x00\x00\x00')  # Data representation
+        response.extend(b'\x44\x00\x00\x00')  # Fragment length (68 bytes)
+        response.extend(b'\x00\x00\x00\x00')  # Auth length
+        response.extend(b'\x01\x00\x00\x00')  # Call ID (1)
+        response.extend(b'\x00\x00\x00\x00')  # Max transmit frag
+        response.extend(b'\x00\x00\x00\x00')  # Max receive frag
+        response.extend(b'\x26\x4d\x00\x00')  # Assoc group
+        response.extend(b'\x0d\x00\x00\x00')  # Secondary address length
+        response.extend(b'\\PIPE\\srvsvc')    # Secondary address
+        response.extend(b'\x01\x00\x00\x00')  # Number of results
+        response.extend(b'\x00\x00\x00\x00')  # Result: acceptance
+        response.extend(b'\x8a\x88\x5d\x04')  # Transfer syntax UUID
+        response.extend(b'\x1c\xeb\x11\xc9')
+        response.extend(b'\x9f\xe8\x08\x00')
+        response.extend(b'\x2b\x10\x48\x60')
+        response.extend(b'\x02\x00\x00\x00')  # Transfer syntax version
+        
+        return bytes(response)
 
-        smbServer.setConnectionData(connId, connData)
+    @staticmethod
+    def _craft_net_share_enum_all_response():
+        """
+        Craft a NetShareEnumAll response with our honeypot shares
+        This returns PUBLIC and IPC$ shares to make the honeypot look realistic
+        """
+        # NetShareEnumAll response structure
+        # Based on the working traffic analysis
+        response = bytearray()
         
-        # CRITICAL FIX: Ensure we return the response in the correct format
-        # The SMB2 IOCTL handler expects (outputData, errorCode)
-        # where outputData should be the raw response data
-        if errorCode == STATUS_SUCCESS:
-            smbServer.log(f"HONEYPOT: fsctlPipeTransceive returning success response for {client_ip} - length: {len(ioctlResponse)}", logging.DEBUG)
-            return ioctlResponse, errorCode
-        else:
-            smbServer.log(f"HONEYPOT: fsctlPipeTransceive returning error for {client_ip} - errorCode: 0x{errorCode:08x}", logging.WARNING)
-            # Return empty response on error to prevent corruption
-            return b'', errorCode
+        # DCERPC Header
+        response.extend(b'\x05\x00')  # Version 5.0
+        response.extend(b'\x02')      # Packet type: RESPONSE (2)
+        response.extend(b'\x03')      # Flags: first + last fragment
+        response.extend(b'\x10\x00\x00\x00')  # Data representation
+        response.extend(b'\x40\x02\x00\x00')  # Fragment length (576 bytes)
+        response.extend(b'\x00\x00\x00\x00')  # Auth length
+        response.extend(b'\x00\x00\x00\x00')  # Call ID (0)
+        response.extend(b'\x28\x02\x00\x00')  # Alloc hint (552 bytes)
+        response.extend(b'\x00\x00\x00\x00')  # Context ID
+        response.extend(b'\x00')              # Cancel count
+        response.extend(b'\x0f')              # Opnum (15 = NetShareEnumAll)
+        
+        # NetShareEnumAll response stub data
+        # This is a simplified response with our honeypot shares
+        response.extend(b'\x00\x00\x00\x00')  # Return code (success)
+        response.extend(b'\x00\x00\x00\x00')  # Info level (1)
+        response.extend(b'\x00\x00\x00\x00')  # Share count (2)
+        
+        # Share 1: PUBLIC
+        response.extend(b'\x00\x00\x00\x00')  # Referent ID for name
+        response.extend(b'\x06\x00\x00\x00')  # Name length
+        response.extend(b'\x00\x00')          # Name offset
+        response.extend(b'\x06\x00\x00\x00')  # Name actual count
+        response.extend(b'PUBLIC')            # Share name
+        response.extend(b'\x00\x00')          # Padding
+        response.extend(b'\x00\x00\x00\x00')  # Share type (0 = disk)
+        response.extend(b'\x00\x00\x00\x00')  # Referent ID for comment
+        response.extend(b'\x00\x00\x00\x00')  # Comment length
+        response.extend(b'\x00\x00')          # Comment offset
+        response.extend(b'\x00\x00\x00\x00')  # Comment actual count
+        
+        # Share 2: IPC$
+        response.extend(b'\x00\x00\x00\x00')  # Referent ID for name
+        response.extend(b'\x04\x00\x00\x00')  # Name length
+        response.extend(b'\x00\x00')          # Name offset
+        response.extend(b'\x04\x00\x00\x00')  # Name actual count
+        response.extend(b'IPC$')              # Share name
+        response.extend(b'\x00\x00')          # Padding
+        response.extend(b'\x02\x00\x00\x00')  # Share type (2 = named pipe)
+        response.extend(b'\x00\x00\x00\x00')  # Referent ID for comment
+        response.extend(b'\x00\x00\x00\x00')  # Comment length
+        response.extend(b'\x00\x00')          # Comment offset
+        response.extend(b'\x00\x00\x00\x00')  # Comment actual count
+        
+        # Pad to match expected length
+        while len(response) < 576:
+            response.extend(b'\x00')
+        
+        return bytes(response)
 
     @staticmethod
     def fsctlValidateNegotiateInfo(connId, smbServer, ioctlRequest):
