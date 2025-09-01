@@ -954,7 +954,7 @@ class TRANS2Commands:
                     smbServer.log(f"HONEYPOT: Share enumeration response created for {client_ip} - NTFS filesystem", logging.INFO)
                 else:
                     # Use default handler for other levels
-                    data = queryFsInformation(connData['ConnectedShares'][recvPacket['Tid']]['path'], '',
+            data = queryFsInformation(connData['ConnectedShares'][recvPacket['Tid']]['path'], '',
                                               level, pktFlags=recvPacket['Flags2'])
             else:
                 # Use default handler for non-share-enumeration requests
@@ -3412,15 +3412,15 @@ class SMB2Commands:
                     smbServer.log(f"HONEYPOT: Enforced read-only mode for {fileName} from {connData.get('ClientIP', 'unknown')}", logging.INFO)
                 else:
                     # Original logic (not used in honeypot mode)
+                if (desiredAccess & smb2.FILE_READ_DATA) or (desiredAccess & smb2.GENERIC_READ):
+                    mode |= os.O_RDONLY
+                if (desiredAccess & smb2.FILE_WRITE_DATA) or (desiredAccess & smb2.GENERIC_WRITE):
                     if (desiredAccess & smb2.FILE_READ_DATA) or (desiredAccess & smb2.GENERIC_READ):
-                        mode |= os.O_RDONLY
-                    if (desiredAccess & smb2.FILE_WRITE_DATA) or (desiredAccess & smb2.GENERIC_WRITE):
-                        if (desiredAccess & smb2.FILE_READ_DATA) or (desiredAccess & smb2.GENERIC_READ):
-                            mode |= os.O_RDWR  # | os.O_APPEND
-                        else:
-                            mode |= os.O_WRONLY  # | os.O_APPEND
-                    if desiredAccess & smb2.GENERIC_ALL:
                         mode |= os.O_RDWR  # | os.O_APPEND
+                    else:
+                        mode |= os.O_WRONLY  # | os.O_APPEND
+                if desiredAccess & smb2.GENERIC_ALL:
+                    mode |= os.O_RDWR  # | os.O_APPEND
 
                 createOptions = ntCreateRequest['CreateOptions']
                 
@@ -3583,14 +3583,14 @@ class SMB2Commands:
                             smbServer.log(f"HONEYPOT: BLOCKED FILE DELETION from {client_ip} - File: {pathName}", logging.WARNING)
                             errorCode = STATUS_ACCESS_DENIED
                         else:
-                            try:
-                                if os.path.isdir(pathName):
-                                    shutil.rmtree(connData['OpenedFiles'][fileID]['FileName'])
-                                else:
-                                    os.remove(connData['OpenedFiles'][fileID]['FileName'])
-                            except Exception as e:
-                                smbServer.log("SMB2_CLOSE %s" % e, logging.ERROR)
-                                errorCode = STATUS_ACCESS_DENIED
+                        try:
+                            if os.path.isdir(pathName):
+                                shutil.rmtree(connData['OpenedFiles'][fileID]['FileName'])
+                            else:
+                                os.remove(connData['OpenedFiles'][fileID]['FileName'])
+                        except Exception as e:
+                            smbServer.log("SMB2_CLOSE %s" % e, logging.ERROR)
+                            errorCode = STATUS_ACCESS_DENIED
 
                     # Now fill out the response
                     if infoRecord is not None:
@@ -4184,7 +4184,7 @@ class SMB2Commands:
         smbServer.log(f"HONEYPOT: IOCTL Buffer length: {len(ioctlRequest['Buffer'])}", logging.DEBUG)
         if len(ioctlRequest['Buffer']) > 0:
             smbServer.log(f"HONEYPOT: IOCTL Buffer preview: {ioctlRequest['Buffer'][:50].hex()}", logging.DEBUG)
-        
+
         ioctls = smbServer.getIoctls()
         smbServer.log(f"HONEYPOT: Available IOCTL handlers: {list(ioctls.keys())}", logging.DEBUG)
         if ioctlRequest['CtlCode'] in ioctls:
@@ -4303,7 +4303,7 @@ class Ioctls:
             smbServer.log(f"HONEYPOT: Default pipe transceive for {client_ip} - returning empty response", logging.DEBUG)
             return b'\x00' * 64, STATUS_SUCCESS
             
-        except Exception as e:
+            except Exception as e:
             smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
             return b'\x00' * 64, STATUS_SUCCESS
 
@@ -4333,8 +4333,9 @@ class Ioctls:
         response.extend(b'\x01\x00\x00\x00')  # Number of results
         response.extend(b'\x00\x00\x00\x00')  # Result: acceptance
         
-        # Transfer syntax UUID (required for DCERPC BIND_ACK) - reduced to 8 bytes to achieve 68 total
+        # Transfer syntax UUID (required for DCERPC BIND_ACK) - 12 bytes to achieve 68 total
         response.extend(b'\x8a\x88\x5d\x04')  # Transfer syntax UUID (first 4 bytes)
+        response.extend(b'\x1c\xeb\x11\xc9')  # Transfer syntax UUID (next 4 bytes)
         response.extend(b'\x02\x00\x00\x00')  # Transfer syntax version
         
         # Verify the response is exactly 68 bytes
@@ -5109,10 +5110,10 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                                 # Check if this command has been hooked (custom handler)
                                 if packet['Command'] in self.__smb2Commands and hasattr(self.__smb2Commands[packet['Command']], '__name__'):
                                     # This is a custom hook, call it directly
-                                    respCommands, respPackets, errorCode = self.__smb2Commands[packet['Command']](
-                                        connId,
-                                        self,
-                                        packet)
+                                respCommands, respPackets, errorCode = self.__smb2Commands[packet['Command']](
+                                    connId,
+                                    self,
+                                    packet)
                                     # HONEYPOT: Log hook execution
                                     self.log(f"HONEYPOT: Custom hook executed for SMB2 command 0x{packet['Command']:02x}", logging.INFO)
                                 else:
