@@ -4247,6 +4247,8 @@ class Ioctls:
     def fsctlPipeTransceive(connId, smbServer, ioctlRequest):
         connData = smbServer.getConnectionData(connId)
         client_ip = connData.get('ClientIP', 'unknown')
+        
+        smbServer.log(f"HONEYPOT: fsctlPipeTransceive called for {client_ip} - CtlCode: 0x{ioctlRequest['CtlCode']:08x}", logging.INFO)
 
         ioctlResponse = ''
 
