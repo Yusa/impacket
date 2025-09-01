@@ -4163,10 +4163,18 @@ class SMB2Commands:
         
         # HONEYPOT: Log IOCTL request details
         ctl_code = ioctlRequest['CtlCode']
-        smbServer.log(f"HONEYPOT: IOCTL request from {client_ip} - CtlCode: 0x{ctl_code:08x}", logging.DEBUG)
+        smbServer.log(f"HONEYPOT: IOCTL request from {client_ip} - CtlCode: 0x{ctl_code:08x}", logging.INFO)
+        
+        # HONEYPOT: Log additional IOCTL details for debugging
+        smbServer.log(f"HONEYPOT: IOCTL FileID: {ioctlRequest['FileID'].getData().hex()}", logging.DEBUG)
+        smbServer.log(f"HONEYPOT: IOCTL Buffer length: {len(ioctlRequest['Buffer'])}", logging.DEBUG)
+        if len(ioctlRequest['Buffer']) > 0:
+            smbServer.log(f"HONEYPOT: IOCTL Buffer preview: {ioctlRequest['Buffer'][:50].hex()}", logging.DEBUG)
         
         ioctls = smbServer.getIoctls()
+        smbServer.log(f"HONEYPOT: Available IOCTL handlers: {list(ioctls.keys())}", logging.DEBUG)
         if ioctlRequest['CtlCode'] in ioctls:
+            smbServer.log(f"HONEYPOT: Calling IOCTL handler for CtlCode: 0x{ioctlRequest['CtlCode']:08x}", logging.INFO)
             outputData, errorCode = ioctls[ioctlRequest['CtlCode']](connId, smbServer, ioctlRequest)
             if errorCode == STATUS_SUCCESS:
                 respSMBCommand['CtlCode'] = ioctlRequest['CtlCode']
