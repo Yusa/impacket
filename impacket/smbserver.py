@@ -3333,8 +3333,8 @@ class SMB2Commands:
             # This prevents conflicts between virtual named pipe handling and filesystem access
             if share_name == 'IPC$' and fileName in ['srvsvc', 'wkssvc']:
                 smbServer.log(f"HONEYPOT: Skipping filesystem logic for virtual named pipe: {fileName}", logging.INFO)
-                # We've already handled this in the IPC$ logic above, so just continue
-                pass
+                # We've already handled this in the IPC$ logic above, so return success
+                return [respSMBCommand], None, STATUS_SUCCESS
             elif not isInFileJail(path, fileName):
                 LOG.error("Path not in current working directory")
                 return [smb2.SMB2Error()], None, STATUS_OBJECT_PATH_SYNTAX_BAD
