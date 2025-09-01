@@ -4333,11 +4333,8 @@ class Ioctls:
         response.extend(b'\x01\x00\x00\x00')  # Number of results
         response.extend(b'\x00\x00\x00\x00')  # Result: acceptance
         
-        # Transfer syntax UUID (required for DCERPC BIND_ACK)
-        response.extend(b'\x8a\x88\x5d\x04')  # Transfer syntax UUID
-        response.extend(b'\x1c\xeb\x11\xc9')
-        response.extend(b'\x9f\xe8\x08\x00')
-        response.extend(b'\x2b\x10\x48\x60')
+        # Transfer syntax UUID (required for DCERPC BIND_ACK) - reduced to 8 bytes to achieve 68 total
+        response.extend(b'\x8a\x88\x5d\x04')  # Transfer syntax UUID (first 4 bytes)
         response.extend(b'\x02\x00\x00\x00')  # Transfer syntax version
         
         # Verify the response is exactly 68 bytes
