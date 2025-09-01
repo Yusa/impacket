@@ -925,11 +925,41 @@ class TRANS2Commands:
     @staticmethod
     def queryFsInformation(connId, smbServer, recvPacket, parameters, data, maxDataCount=0):
         connData = smbServer.getConnectionData(connId)
+        client_ip = connData.get('ClientIP', 'unknown')
+        
+        # HONEYPOT: Log SMB1 TRANS2_QUERY_FS_INFORMATION
+        smbServer.log(f"HONEYPOT: SMB1 TRANS2_QUERY_FS_INFORMATION from {client_ip}", logging.INFO)
+        
         errorCode = 0
         # Get the Tid associated
         if recvPacket['Tid'] in connData['ConnectedShares']:
-            data = queryFsInformation(connData['ConnectedShares'][recvPacket['Tid']]['path'], '',
-                                      struct.unpack('<H', parameters)[0], pktFlags=recvPacket['Flags2'])
+            # HONEYPOT: Check if this is a share enumeration request
+            level = struct.unpack('<H', parameters)[0]
+            smbServer.log(f"HONEYPOT: TRANS2_QUERY_FS_INFORMATION level: 0x{level:04x} from {client_ip}", logging.DEBUG)
+            
+            # Check if this is a share enumeration request (common levels for share info)
+            if level in [0x0001, 0x0002, 0x0003, 0x0004, 0x0005]:  # Common FS info levels
+                smbServer.log(f"HONEYPOT: Share enumeration request detected from {client_ip} - level 0x{level:04x}", logging.INFO)
+                
+                # For share enumeration, return our honeypot share information
+                if level == 0x0003:  # SMB_QUERY_FS_ATTRIBUTE_INFO
+                    # Return filesystem attributes that indicate this is a valid share
+                    fs_data = smb.SMBQueryFsAttributeInfo()
+                    fs_data['FileSystemAttributes'] = smb.FILE_CASE_SENSITIVE_SEARCH | smb.FILE_CASE_PRESERVED_NAMES
+                    fs_data['MaxFilenNameLengthInBytes'] = 255
+                    fs_data['LengthOfFileSystemName'] = len('NTFS') * 2
+                    fs_data['FileSystemName'] = 'NTFS'.encode('utf-16le')
+                    data = fs_data.getData()
+                    
+                    smbServer.log(f"HONEYPOT: Share enumeration response created for {client_ip} - NTFS filesystem", logging.INFO)
+                else:
+                    # Use default handler for other levels
+                    data = queryFsInformation(connData['ConnectedShares'][recvPacket['Tid']]['path'], '',
+                                              level, pktFlags=recvPacket['Flags2'])
+            else:
+                # Use default handler for non-share-enumeration requests
+                data = queryFsInformation(connData['ConnectedShares'][recvPacket['Tid']]['path'], '',
+                                          level, pktFlags=recvPacket['Flags2'])
 
         smbServer.setConnectionData(connId, connData)
 
