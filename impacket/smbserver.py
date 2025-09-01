@@ -4259,36 +4259,53 @@ class Ioctls:
                     if b'srvsvc' in buffer_data.lower() or b'wkssvc' in buffer_data.lower():
                         smbServer.log(f"HONEYPOT: Share enumeration RPC detected from {client_ip}", logging.INFO)
                         
-                        # Create a mock response for share enumeration
-                        # This is a simplified RPC response structure
+                        # Create a proper RPC response for share enumeration
+                        # This follows the MS-RPCE (RPC over SMB) specification
+                        
+                        # RPC Header (20 bytes)
                         rpc_response = b''
-                        rpc_response += b'\x05\x00'  # RPC version
-                        rpc_response += b'\x00\x00'  # RPC version minor
-                        rpc_response += b'\x03'      # Packet type (response)
-                        rpc_response += b'\x00'      # Flags
-                        rpc_response += b'\x00\x00\x00'  # Data representation
-                        rpc_response += b'\x00\x00'      # Frag length
-                        rpc_response += b'\x00\x00'      # Auth length
+                        rpc_response += b'\x05\x00'  # RPC version (5.0)
+                        rpc_response += b'\x00\x00'  # RPC version minor (0.0)
+                        rpc_response += b'\x03'      # Packet type (3 = response)
+                        rpc_response += b'\x00'      # Flags1
+                        rpc_response += b'\x00'      # Flags2
+                        rpc_response += b'\x00\x00'  # Data representation (little-endian, ASCII, IEEE)
+                        rpc_response += b'\x00\x00'  # Frag length (will be set below)
+                        rpc_response += b'\x00\x00'  # Auth length
                         rpc_response += b'\x00\x00\x00\x00'  # Call ID
                         
-                        # Add share enumeration data
-                        shares_data = b''
-                        shares_data += b'\x00\x00\x00\x00'  # Status (success)
-                        shares_data += b'\x02\x00\x00\x00'  # Number of shares
+                        # RPC Response Body
+                        # NetrShareEnum response structure
+                        response_body = b''
+                        response_body += b'\x00\x00\x00\x00'  # Status (0 = success)
+                        response_body += b'\x02\x00\x00\x00'  # Number of shares
                         
-                        # PUBLIC share
-                        shares_data += b'PUBLIC' + b'\x00' * 11  # Share name (16 bytes)
-                        shares_data += b'\x00\x00\x00\x00'  # Share type (disk)
-                        shares_data += b'Public Share' + b'\x00' * 37  # Comment (48 bytes)
+                        # PUBLIC share entry
+                        share_name = b'PUBLIC'
+                        share_name_padded = share_name + b'\x00' * (16 - len(share_name))  # Pad to 16 bytes
+                        share_type = b'\x00\x00\x00\x00'  # STYPE_DISKTREE (disk share)
+                        share_comment = b'Public Share'
+                        share_comment_padded = share_comment + b'\x00' * (48 - len(share_comment))  # Pad to 48 bytes
                         
-                        # IPC$ share
-                        shares_data += b'IPC$' + b'\x00' * 12  # Share name (16 bytes)
-                        shares_data += b'\x03\x00\x00\x00'  # Share type (IPC)
-                        shares_data += b'Remote IPC' + b'\x00' * 38  # Comment (48 bytes)
+                        response_body += share_name_padded + share_type + share_comment_padded
                         
-                        rpc_response += shares_data
+                        # IPC$ share entry
+                        share_name2 = b'IPC$'
+                        share_name2_padded = share_name2 + b'\x00' * (16 - len(share_name2))  # Pad to 16 bytes
+                        share_type2 = b'\x03\x00\x00\x00'  # STYPE_IPC (IPC share)
+                        share_comment2 = b'Remote IPC'
+                        share_comment2_padded = share_comment2 + b'\x00' * (48 - len(share_comment2))  # Pad to 48 bytes
                         
-                        smbServer.log(f"HONEYPOT: Share enumeration RPC response created for {client_ip} - 2 shares", logging.INFO)
+                        response_body += share_name2_padded + share_type2 + share_comment2_padded
+                        
+                        # Set the fragment length in the RPC header
+                        total_length = len(rpc_response) + len(response_body)
+                        rpc_response = rpc_response[:6] + struct.pack('<H', total_length) + rpc_response[8:]
+                        
+                        # Combine header and body
+                        rpc_response += response_body
+                        
+                        smbServer.log(f"HONEYPOT: Share enumeration RPC response created for {client_ip} - 2 shares, total length: {len(rpc_response)}", logging.INFO)
                         ioctlResponse = rpc_response
                         
                     else:
