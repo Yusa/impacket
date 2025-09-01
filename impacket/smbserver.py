@@ -3329,7 +3329,7 @@ class SMB2Commands:
                     connData['OpenedFiles'][file_id_bytes]['PipeName'] = fileName
                     
                     # Log successful virtual named pipe creation
-                    smbServer.log(f"HONEYPOT: Virtual named pipe created: {fileName} -> {virtual_file_id} (FileID: {file_id_bytes.hex()})", logging.INFO)
+                    smbServer.log(f"HONEYPOT: Virtual named pipe created: {fileName} (FileID: {file_id_bytes.hex()})", logging.INFO)
                     smbServer.log(f"HONEYPOT: Virtual named pipe stored in OpenedFiles with FileID: {file_id_bytes.hex()}", logging.DEBUG)
                     
                     # Return success immediately - no filesystem access needed
@@ -4331,11 +4331,7 @@ class Ioctls:
         response.extend(b'\\PIPE\\srvsvc')    # Secondary address (13 bytes)
         response.extend(b'\x01\x00\x00\x00')  # Number of results
         response.extend(b'\x00\x00\x00\x00')  # Result: acceptance
-        response.extend(b'\x8a\x88\x5d\x04')  # Transfer syntax UUID
-        response.extend(b'\x1c\xeb\x11\xc9')
-        response.extend(b'\x9f\xe8\x08\x00')
-        response.extend(b'\x2b\x10\x48\x60')
-        response.extend(b'\x02\x00\x00\x00')  # Transfer syntax version
+        # Removed UUID fields to reduce from 76 to 68 bytes
         
         # Verify the response is exactly 68 bytes
         assert len(response) == 68, f"BIND_ACK response must be exactly 68 bytes, got {len(response)}"
