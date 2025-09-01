@@ -4340,9 +4340,19 @@ class Ioctls:
                     else:
                         # Default pipe behavior for other RPC calls
                         smbServer.log(f"HONEYPOT: Default pipe transceive for {client_ip}", logging.DEBUG)
-                        sock = connData['OpenedFiles'][ioctlRequest['FileID'].getData()]['Socket']
-                        sock.sendall(ioctlRequest['Buffer'])
-                        ioctlResponse = sock.recv(ioctlRequest['MaxOutputResponse'])
+                        
+                        # Check if this is a virtual named pipe (our honeypot pipes don't have real sockets)
+                        file_id = ioctlRequest['FileID'].getData()
+                        if file_id in connData['OpenedFiles'] and connData['OpenedFiles'][file_id].get('VirtualPipe', False):
+                            smbServer.log(f"HONEYPOT: Virtual named pipe IOCTL for {client_ip} - pipe: {connData['OpenedFiles'][file_id].get('PipeName', 'unknown')}", logging.INFO)
+                            # For virtual named pipes, return a default response
+                            # This prevents the 'Socket' error
+                            ioctlResponse = b'\x00' * 64  # Default empty response
+                        else:
+                            # Real named pipe with socket
+                            sock = connData['OpenedFiles'][ioctlRequest['FileID'].getData()]['Socket']
+                            sock.sendall(ioctlRequest['Buffer'])
+                            ioctlResponse = sock.recv(ioctlRequest['MaxOutputResponse'])
                         
             except Exception as e:
                 smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
