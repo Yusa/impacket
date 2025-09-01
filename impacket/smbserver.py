@@ -4252,11 +4252,16 @@ class Ioctls:
 
         ioctlResponse = ''
 
+        smbServer.log(f"HONEYPOT: fsctlPipeTransceive - FileID: {ioctlRequest['FileID'].getData().hex()}", logging.DEBUG)
+        smbServer.log(f"HONEYPOT: fsctlPipeTransceive - OpenedFiles keys: {list(connData['OpenedFiles'].keys())}", logging.DEBUG)
+        
         if ioctlRequest['FileID'].getData() in connData['OpenedFiles']:
             fileHandle = connData['OpenedFiles'][ioctlRequest['FileID'].getData()]['FileHandle']
+            smbServer.log(f"HONEYPOT: fsctlPipeTransceive - Found file handle: {fileHandle}", logging.DEBUG)
             errorCode = STATUS_SUCCESS
             try:
                 if fileHandle != PIPE_FILE_DESCRIPTOR:
+                    smbServer.log(f"HONEYPOT: fsctlPipeTransceive - Invalid file handle type: {fileHandle}", logging.DEBUG)
                     errorCode = STATUS_INVALID_DEVICE_REQUEST
                 else:
                     # HONEYPOT: Handle RPC calls through named pipes for share enumeration
@@ -4264,6 +4269,7 @@ class Ioctls:
                     
                     # Check if this is a share enumeration request
                     buffer_data = ioctlRequest['Buffer']
+                    smbServer.log(f"HONEYPOT: Buffer data preview: {buffer_data[:100].hex()}", logging.DEBUG)
                     
                     # Simple heuristic: if it contains "srvsvc" or "wkssvc" related data, it's likely share enumeration
                     if b'srvsvc' in buffer_data.lower() or b'wkssvc' in buffer_data.lower():
