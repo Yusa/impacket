@@ -3214,17 +3214,24 @@ class SMB2Commands:
             
             # DEBUG: Check what's in connData and recvPacket
             smbServer.log(f"HONEYPOT: DEBUG - connData keys: {list(connData.keys()) if connData else 'None'}", logging.INFO)
-            smbServer.log(f"HONEYPOT: DEBUG - recvPacket TreeID: {recvPacket['TreeID'] if 'TreeID' in recvPacket else 'None'}", logging.INFO)
             
-            if 'ConnectedShares' in connData and recvPacket['TreeID'] in connData['ConnectedShares']:
-                share_info = connData['ConnectedShares'][recvPacket['TreeID']]
+            # SAFE: Get TreeID with defensive programming
+            try:
+                tree_id = recvPacket['TreeID']
+                smbServer.log(f"HONEYPOT: DEBUG - recvPacket TreeID: {tree_id}", logging.INFO)
+            except (KeyError, TypeError, AttributeError) as e:
+                smbServer.log(f"HONEYPOT: DEBUG - ERROR accessing TreeID: {e}", logging.ERROR)
+                tree_id = None
+            
+            if 'ConnectedShares' in connData and tree_id and tree_id in connData['ConnectedShares']:
+                share_info = connData['ConnectedShares'][tree_id]
                 share_name = share_info.get('share', '')
                 smbServer.log(f"HONEYPOT: DEBUG - Found share info: {share_info}", logging.INFO)
             else:
                 smbServer.log(f"HONEYPOT: DEBUG - No ConnectedShares or TreeID not found", logging.INFO)
             
             # DEBUG: Log what we're processing
-            smbServer.log(f"HONEYPOT: DEBUG - Processing CREATE for file: {fileName}, share: {share_name}, TreeID: {recvPacket['TreeID']}", logging.INFO)
+            smbServer.log(f"HONEYPOT: DEBUG - Processing CREATE for file: {fileName}, share: {share_name}, TreeID: {tree_id}", logging.INFO)
             
             if share_name == 'IPC$':
                 smbServer.log(f"HONEYPOT: DEBUG - Entered IPC$ logic for file: {fileName}", logging.DEBUG)
