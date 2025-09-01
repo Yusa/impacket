@@ -4361,7 +4361,17 @@ class Ioctls:
             errorCode = STATUS_INVALID_DEVICE_REQUEST
 
         smbServer.setConnectionData(connId, connData)
-        return ioctlResponse, errorCode
+        
+        # CRITICAL FIX: Ensure we return the response in the correct format
+        # The SMB2 IOCTL handler expects (outputData, errorCode)
+        # where outputData should be the raw response data
+        if errorCode == STATUS_SUCCESS:
+            smbServer.log(f"HONEYPOT: fsctlPipeTransceive returning success response for {client_ip} - length: {len(ioctlResponse)}", logging.DEBUG)
+            return ioctlResponse, errorCode
+        else:
+            smbServer.log(f"HONEYPOT: fsctlPipeTransceive returning error for {client_ip} - errorCode: 0x{errorCode:08x}", logging.WARNING)
+            # Return empty response on error to prevent corruption
+            return b'', errorCode
 
     @staticmethod
     def fsctlValidateNegotiateInfo(connId, smbServer, ioctlRequest):
