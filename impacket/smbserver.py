@@ -4342,7 +4342,7 @@ class Ioctls:
     @staticmethod
     def _craft_net_share_enum_all_response():
         """
-        Craft a NetShareEnumAll response with our honeypot shares
+        Craft a NetShareEnumAll response containing "PUBLIC" and "IPC$" shares.
         This returns PUBLIC and IPC$ shares to make the honeypot look realistic
         """
         # NetShareEnumAll response structure
