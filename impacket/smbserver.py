@@ -4189,6 +4189,7 @@ class Ioctls:
     @staticmethod
     def fsctlPipeTransceive(connId, smbServer, ioctlRequest):
         connData = smbServer.getConnectionData(connId)
+        client_ip = connData.get('ClientIP', 'unknown')
 
         ioctlResponse = ''
 
@@ -4199,11 +4200,57 @@ class Ioctls:
                 if fileHandle != PIPE_FILE_DESCRIPTOR:
                     errorCode = STATUS_INVALID_DEVICE_REQUEST
                 else:
-                    sock = connData['OpenedFiles'][ioctlRequest['FileID'].getData()]['Socket']
-                    sock.sendall(ioctlRequest['Buffer'])
-                    ioctlResponse = sock.recv(ioctlRequest['MaxOutputResponse'])
+                    # HONEYPOT: Handle RPC calls through named pipes for share enumeration
+                    smbServer.log(f"HONEYPOT: Pipe transceive from {client_ip} - Buffer length: {len(ioctlRequest['Buffer'])}", logging.DEBUG)
+                    
+                    # Check if this is a share enumeration request
+                    buffer_data = ioctlRequest['Buffer']
+                    
+                    # Simple heuristic: if it contains "srvsvc" or "wkssvc" related data, it's likely share enumeration
+                    if b'srvsvc' in buffer_data.lower() or b'wkssvc' in buffer_data.lower():
+                        smbServer.log(f"HONEYPOT: Share enumeration RPC detected from {client_ip}", logging.INFO)
+                        
+                        # Create a mock response for share enumeration
+                        # This is a simplified RPC response structure
+                        rpc_response = b''
+                        rpc_response += b'\x05\x00'  # RPC version
+                        rpc_response += b'\x00\x00'  # RPC version minor
+                        rpc_response += b'\x03'      # Packet type (response)
+                        rpc_response += b'\x00'      # Flags
+                        rpc_response += b'\x00\x00\x00'  # Data representation
+                        rpc_response += b'\x00\x00'      # Frag length
+                        rpc_response += b'\x00\x00'      # Auth length
+                        rpc_response += b'\x00\x00\x00\x00'  # Call ID
+                        
+                        # Add share enumeration data
+                        shares_data = b''
+                        shares_data += b'\x00\x00\x00\x00'  # Status (success)
+                        shares_data += b'\x02\x00\x00\x00'  # Number of shares
+                        
+                        # PUBLIC share
+                        shares_data += b'PUBLIC' + b'\x00' * 11  # Share name (16 bytes)
+                        shares_data += b'\x00\x00\x00\x00'  # Share type (disk)
+                        shares_data += b'Public Share' + b'\x00' * 37  # Comment (48 bytes)
+                        
+                        # IPC$ share
+                        shares_data += b'IPC$' + b'\x00' * 12  # Share name (16 bytes)
+                        shares_data += b'\x03\x00\x00\x00'  # Share type (IPC)
+                        shares_data += b'Remote IPC' + b'\x00' * 38  # Comment (48 bytes)
+                        
+                        rpc_response += shares_data
+                        
+                        smbServer.log(f"HONEYPOT: Share enumeration RPC response created for {client_ip} - 2 shares", logging.INFO)
+                        ioctlResponse = rpc_response
+                        
+                    else:
+                        # Default pipe behavior for other RPC calls
+                        smbServer.log(f"HONEYPOT: Default pipe transceive for {client_ip}", logging.DEBUG)
+                        sock = connData['OpenedFiles'][ioctlRequest['FileID'].getData()]['Socket']
+                        sock.sendall(ioctlRequest['Buffer'])
+                        ioctlResponse = sock.recv(ioctlRequest['MaxOutputResponse'])
+                        
             except Exception as e:
-                smbServer.log('fsctlPipeTransceive: %s ' % e, logging.ERROR)
+                smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
                 errorCode = STATUS_ACCESS_DENIED
         else:
             errorCode = STATUS_INVALID_DEVICE_REQUEST
@@ -4226,6 +4273,54 @@ class Ioctls:
 
         smbServer.setConnectionData(connId, connData)
         return validateNegotiateInfoResponse.getData(), errorCode
+
+    @staticmethod
+    def fsctlNetrShareEnum(connId, smbServer, ioctlRequest):
+        """HONEYPOT: Handle share enumeration IOCTL for smbutil view"""
+        connData = smbServer.getConnectionData(connId)
+        client_ip = connData.get('ClientIP', 'unknown')
+        
+        smbServer.log(f"HONEYPOT: Share enumeration IOCTL from {client_ip}", logging.INFO)
+        
+        # Create a response with our honeypot shares
+        # This is what smbutil view needs to see
+        shares_data = b''
+        
+        # Add PUBLIC share
+        shares_data += b'\x00\x00'  # Share name length
+        shares_data += b'PUBLIC' + b'\x00' * (14 - len('PUBLIC'))  # Share name (14 bytes)
+        shares_data += b'\x00' * 4  # Reserved
+        shares_data += b'\x00\x00\x00\x00'  # Share type (disk)
+        shares_data += b'Public Share' + b'\x00' * (48 - len('Public Share'))  # Comment (48 bytes)
+        
+        # Add IPC$ share  
+        shares_data += b'\x00\x00'  # Share name length
+        shares_data += b'IPC$' + b'\x00' * (14 - len('IPC$'))  # Share name (14 bytes)
+        shares_data += b'\x00' * 4  # Reserved
+        shares_data += b'\x03\x00\x00\x00'  # Share type (IPC)
+        shares_data += b'Remote IPC' + b'\x00' * (48 - len('Remote IPC'))  # Comment (48 bytes)
+        
+        smbServer.log(f"HONEYPOT: Share enumeration completed for {client_ip} - Found 2 shares", logging.INFO)
+        
+        smbServer.setConnectionData(connId, connData)
+        return shares_data, STATUS_SUCCESS
+
+    @staticmethod
+    def fsctlNetrWkstaGetInfo(connId, smbServer, ioctlRequest):
+        """HONEYPOT: Handle workstation info IOCTL for smbutil view"""
+        connData = smbServer.getConnectionData(connId)
+        client_ip = connData.get('ClientIP', 'unknown')
+        
+        smbServer.log(f"HONEYPOT: Workstation info IOCTL from {client_ip}", logging.INFO)
+        
+        # Return basic workstation info
+        wksta_info = b'TROPICO-HONEYPOT' + b'\x00' * 16  # Computer name
+        wksta_info += b'WORKGROUP' + b'\x00' * 16  # Workgroup name
+        
+        smbServer.log(f"HONEYPOT: Workstation info provided for {client_ip}", logging.INFO)
+        
+        smbServer.setConnectionData(connId, connData)
+        return wksta_info, STATUS_SUCCESS
 
 
 class SMBSERVERHandler(socketserver.BaseRequestHandler):
