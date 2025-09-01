@@ -4280,7 +4280,8 @@ class Ioctls:
                     # HONEYPOT: Handle RPC calls through named pipes for share enumeration
                     smbServer.log(f"HONEYPOT: Pipe transceive from {client_ip} - Buffer length: {len(ioctlRequest['Buffer'])}", logging.DEBUG)
                     
-                    # Check if this is a share enumeration request
+                    # CRITICAL FIX: Check for share enumeration FIRST, before handling virtual named pipes
+                    # This ensures share enumeration requests get proper responses
                     buffer_data = ioctlRequest['Buffer']
                     smbServer.log(f"HONEYPOT: Buffer data preview: {buffer_data[:100].hex()}", logging.DEBUG)
                     smbServer.log(f"HONEYPOT: Buffer data as string: {buffer_data[:100]}", logging.DEBUG)
