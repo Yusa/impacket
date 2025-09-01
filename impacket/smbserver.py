@@ -3312,7 +3312,7 @@ class SMB2Commands:
                     respSMBCommand['EndofFile'] = 0
                     respSMBCommand['FileAttributes'] = smb2.FILE_ATTRIBUTE_NORMAL
                     respSMBCommand['ShareAccess'] = smb2.FILE_SHARE_READ | smb2.FILE_SHARE_WRITE | smb2.FILE_SHARE_DELETE
-                    respSMBCommand['ImpersonationLevel'] = smb2.ImpersonationLevel.Impersonation
+                    respSMBCommand['ImpersonationLevel'] = 0x00000002  # SMB2_IL_IMPERSONATION
                     respSMBCommand['CreateContextsOffset'] = 0
                     respSMBCommand['CreateContextsLength'] = 0
                     
