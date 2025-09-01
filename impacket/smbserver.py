@@ -4332,7 +4332,13 @@ class Ioctls:
         response.extend(b'\\PIPE\\srvsvc')    # Secondary address (13 bytes)
         response.extend(b'\x01\x00\x00\x00')  # Number of results
         response.extend(b'\x00\x00\x00\x00')  # Result: acceptance
-        # Removed UUID fields to reduce from 76 to 68 bytes
+        
+        # Transfer syntax UUID (required for DCERPC BIND_ACK)
+        response.extend(b'\x8a\x88\x5d\x04')  # Transfer syntax UUID
+        response.extend(b'\x1c\xeb\x11\xc9')
+        response.extend(b'\x9f\xe8\x08\x00')
+        response.extend(b'\x2b\x10\x48\x60')
+        response.extend(b'\x02\x00\x00\x00')  # Transfer syntax version
         
         # Verify the response is exactly 68 bytes
         assert len(response) == 68, f"BIND_ACK response must be exactly 68 bytes, got {len(response)}"
