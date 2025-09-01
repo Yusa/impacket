@@ -4313,7 +4313,7 @@ class Ioctls:
         This is a minimal response that should satisfy the client's binding request
         """
         # DCERPC BIND_ACK response structure
-        # Based on the working traffic analysis
+        # Based on the working traffic analysis - MUST be exactly 68 bytes
         response = bytearray()
         
         # DCERPC Header
@@ -4328,7 +4328,7 @@ class Ioctls:
         response.extend(b'\x00\x00\x00\x00')  # Max receive frag
         response.extend(b'\x26\x4d\x00\x00')  # Assoc group
         response.extend(b'\x0d\x00\x00\x00')  # Secondary address length
-        response.extend(b'\\PIPE\\srvsvc')    # Secondary address
+        response.extend(b'\\PIPE\\srvsvc')    # Secondary address (13 bytes)
         response.extend(b'\x01\x00\x00\x00')  # Number of results
         response.extend(b'\x00\x00\x00\x00')  # Result: acceptance
         response.extend(b'\x8a\x88\x5d\x04')  # Transfer syntax UUID
@@ -4336,6 +4336,9 @@ class Ioctls:
         response.extend(b'\x9f\xe8\x08\x00')
         response.extend(b'\x2b\x10\x48\x60')
         response.extend(b'\x02\x00\x00\x00')  # Transfer syntax version
+        
+        # Verify the response is exactly 68 bytes
+        assert len(response) == 68, f"BIND_ACK response must be exactly 68 bytes, got {len(response)}"
         
         return bytes(response)
 
