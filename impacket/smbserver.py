@@ -4283,9 +4283,14 @@ class Ioctls:
                     # Check if this is a share enumeration request
                     buffer_data = ioctlRequest['Buffer']
                     smbServer.log(f"HONEYPOT: Buffer data preview: {buffer_data[:100].hex()}", logging.DEBUG)
+                    smbServer.log(f"HONEYPOT: Buffer data as string: {buffer_data[:100]}", logging.DEBUG)
                     
                     # Simple heuristic: if it contains "srvsvc" or "wkssvc" related data, it's likely share enumeration
-                    if b'srvsvc' in buffer_data.lower() or b'wkssvc' in buffer_data.lower():
+                    has_srvsvc = b'srvsvc' in buffer_data.lower()
+                    has_wkssvc = b'wkssvc' in buffer_data.lower()
+                    smbServer.log(f"HONEYPOT: Buffer check - has_srvsvc: {has_srvsvc}, has_wkssvc: {has_wkssvc}", logging.DEBUG)
+                    
+                    if has_srvsvc or has_wkssvc:
                         smbServer.log(f"HONEYPOT: Share enumeration RPC detected from {client_ip}", logging.INFO)
                         
                         # Create a proper RPC response for share enumeration
