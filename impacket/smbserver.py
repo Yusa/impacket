@@ -3225,7 +3225,7 @@ class SMB2Commands:
             
             if 'ConnectedShares' in connData and tree_id and tree_id in connData['ConnectedShares']:
                 share_info = connData['ConnectedShares'][tree_id]
-                share_name = share_info.get('share', '')
+                share_name = share_info.get('shareName', '')  # Use 'shareName' not 'share'
                 smbServer.log(f"HONEYPOT: DEBUG - Found share info: {share_info}", logging.INFO)
             else:
                 smbServer.log(f"HONEYPOT: DEBUG - No ConnectedShares or TreeID not found", logging.INFO)
