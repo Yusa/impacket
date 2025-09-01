@@ -3296,8 +3296,8 @@ class SMB2Commands:
                     
                     # CRITICAL FIX: Properly format SMB2 CREATE response for named pipes
                     # SMB2 FileID must be 16 bytes (128 bits)
-                    import uuid
-                    file_id_bytes = uuid.uuid4().bytes  # Generate proper 16-byte FileID
+                    import uuid as std_uuid
+                    file_id_bytes = std_uuid.uuid4().bytes  # Generate proper 16-byte FileID
                     
                     # Set the properly formatted FileID in the response
                     respSMBCommand['FileID'] = file_id_bytes
@@ -3480,7 +3480,8 @@ class SMB2Commands:
 
         if errorCode == STATUS_SUCCESS:
             # Simple way to generate a fid
-            fakefid = uuid.generate()
+            import uuid as std_uuid
+            fakefid = std_uuid.uuid4().bytes
 
             respSMBCommand['FileID'] = fakefid
             respSMBCommand['CreateAction'] = createDisposition
