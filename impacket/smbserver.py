@@ -3294,11 +3294,30 @@ class SMB2Commands:
                         'share': 'IPC$'
                     }
                     
-                    # Set the file ID in the response
-                    respSMBCommand['FileID'] = virtual_file_id.encode('utf-8')
+                    # CRITICAL FIX: Properly format SMB2 CREATE response for named pipes
+                    # SMB2 FileID must be 16 bytes (128 bits)
+                    import uuid
+                    file_id_bytes = uuid.uuid4().bytes  # Generate proper 16-byte FileID
+                    
+                    # Set the properly formatted FileID in the response
+                    respSMBCommand['FileID'] = file_id_bytes
+                    
+                    # Set other required fields for SMB2 CREATE response
+                    respSMBCommand['CreateAction'] = smb2.FILE_OPENED
+                    respSMBCommand['CreationTime'] = 0
+                    respSMBCommand['LastAccessTime'] = 0
+                    respSMBCommand['LastWriteTime'] = 0
+                    respSMBCommand['ChangeTime'] = 0
+                    respSMBCommand['AllocationSize'] = 0
+                    respSMBCommand['EndofFile'] = 0
+                    respSMBCommand['FileAttributes'] = smb2.FILE_ATTRIBUTE_NORMAL
+                    respSMBCommand['ShareAccess'] = smb2.FILE_SHARE_READ | smb2.FILE_SHARE_WRITE | smb2.FILE_SHARE_DELETE
+                    respSMBCommand['ImpersonationLevel'] = smb2.ImpersonationLevel.Impersonation
+                    respSMBCommand['CreateContextsOffset'] = 0
+                    respSMBCommand['CreateContextsLength'] = 0
                     
                     # Log successful virtual named pipe creation
-                    smbServer.log(f"HONEYPOT: Virtual named pipe created: {fileName} -> {virtual_file_id}", logging.INFO)
+                    smbServer.log(f"HONEYPOT: Virtual named pipe created: {fileName} -> {virtual_file_id} (FileID: {file_id_bytes.hex()})", logging.INFO)
                     
                     # Return success immediately - no filesystem access needed
                     # CRITICAL: Set connection data and return immediately to avoid conflicts
