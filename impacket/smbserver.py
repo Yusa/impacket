@@ -954,12 +954,8 @@ class TRANS2Commands:
                     smbServer.log(f"HONEYPOT: Share enumeration response created for {client_ip} - NTFS filesystem", logging.INFO)
                 else:
                     # Use default handler for other levels
-            data = queryFsInformation(connData['ConnectedShares'][recvPacket['Tid']]['path'], '',
+                    data = queryFsInformation(connData['ConnectedShares'][recvPacket['Tid']]['path'], '',
                                               level, pktFlags=recvPacket['Flags2'])
-            else:
-                # Use default handler for non-share-enumeration requests
-                data = queryFsInformation(connData['ConnectedShares'][recvPacket['Tid']]['path'], '',
-                                          level, pktFlags=recvPacket['Flags2'])
 
         smbServer.setConnectionData(connId, connData)
 
