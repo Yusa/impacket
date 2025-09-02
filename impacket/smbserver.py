@@ -3408,15 +3408,15 @@ class SMB2Commands:
                     smbServer.log(f"HONEYPOT: Enforced read-only mode for {fileName} from {connData.get('ClientIP', 'unknown')}", logging.INFO)
                 else:
                     # Original logic (not used in honeypot mode)
-                if (desiredAccess & smb2.FILE_READ_DATA) or (desiredAccess & smb2.GENERIC_READ):
-                    mode |= os.O_RDONLY
-                if (desiredAccess & smb2.FILE_WRITE_DATA) or (desiredAccess & smb2.GENERIC_WRITE):
                     if (desiredAccess & smb2.FILE_READ_DATA) or (desiredAccess & smb2.GENERIC_READ):
+                        mode |= os.O_RDONLY
+                    if (desiredAccess & smb2.FILE_WRITE_DATA) or (desiredAccess & smb2.GENERIC_WRITE):
+                        if (desiredAccess & smb2.FILE_READ_DATA) or (desiredAccess & smb2.GENERIC_READ):
+                            mode |= os.O_RDWR  # | os.O_APPEND
+                        else:
+                            mode |= os.O_WRONLY  # | os.O_APPEND
+                    if desiredAccess & smb2.GENERIC_ALL:
                         mode |= os.O_RDWR  # | os.O_APPEND
-                    else:
-                        mode |= os.O_WRONLY  # | os.O_APPEND
-                if desiredAccess & smb2.GENERIC_ALL:
-                    mode |= os.O_RDWR  # | os.O_APPEND
 
                 createOptions = ntCreateRequest['CreateOptions']
                 
