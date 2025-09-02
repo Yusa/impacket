@@ -3408,15 +3408,15 @@ class SMB2Commands:
                     smbServer.log(f"HONEYPOT: Enforced read-only mode for {fileName} from {connData.get('ClientIP', 'unknown')}", logging.INFO)
                 else:
                     # Original logic (not used in honeypot mode)
-                if (desiredAccess & smb2.FILE_READ_DATA) or (desiredAccess & smb2.GENERIC_READ):
-                    mode |= os.O_RDONLY
-                if (desiredAccess & smb2.FILE_WRITE_DATA) or (desiredAccess & smb2.GENERIC_WRITE):
                     if (desiredAccess & smb2.FILE_READ_DATA) or (desiredAccess & smb2.GENERIC_READ):
+                        mode |= os.O_RDONLY
+                    if (desiredAccess & smb2.FILE_WRITE_DATA) or (desiredAccess & smb2.GENERIC_WRITE):
+                        if (desiredAccess & smb2.FILE_READ_DATA) or (desiredAccess & smb2.GENERIC_READ):
+                            mode |= os.O_RDWR  # | os.O_APPEND
+                        else:
+                            mode |= os.O_WRONLY  # | os.O_APPEND
+                    if desiredAccess & smb2.GENERIC_ALL:
                         mode |= os.O_RDWR  # | os.O_APPEND
-                    else:
-                        mode |= os.O_WRONLY  # | os.O_APPEND
-                if desiredAccess & smb2.GENERIC_ALL:
-                    mode |= os.O_RDWR  # | os.O_APPEND
 
                 createOptions = ntCreateRequest['CreateOptions']
                 
@@ -3579,14 +3579,14 @@ class SMB2Commands:
                             smbServer.log(f"HONEYPOT: BLOCKED FILE DELETION from {client_ip} - File: {pathName}", logging.WARNING)
                             errorCode = STATUS_ACCESS_DENIED
                         else:
-                        try:
-                            if os.path.isdir(pathName):
-                                shutil.rmtree(connData['OpenedFiles'][fileID]['FileName'])
-                            else:
-                                os.remove(connData['OpenedFiles'][fileID]['FileName'])
-                        except Exception as e:
-                            smbServer.log("SMB2_CLOSE %s" % e, logging.ERROR)
-                            errorCode = STATUS_ACCESS_DENIED
+                            try:
+                                if os.path.isdir(pathName):
+                                    shutil.rmtree(connData['OpenedFiles'][fileID]['FileName'])
+                                else:
+                                    os.remove(connData['OpenedFiles'][fileID]['FileName'])
+                            except Exception as e:
+                                smbServer.log("SMB2_CLOSE %s" % e, logging.ERROR)
+                                errorCode = STATUS_ACCESS_DENIED
 
                     # Now fill out the response
                     if infoRecord is not None:
@@ -4299,9 +4299,9 @@ class Ioctls:
             smbServer.log(f"HONEYPOT: Default pipe transceive for {client_ip} - returning empty response", logging.DEBUG)
             return b'\x00' * 64, STATUS_SUCCESS
             
-            except Exception as e:
-            smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
-            return b'\x00' * 64, STATUS_SUCCESS
+        except Exception as e:
+                smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
+                return b'\x00' * 64, STATUS_SUCCESS
 
     @staticmethod
     def _craft_dcerpc_bind_ack():
@@ -5106,7 +5106,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                                 # Check if this command has been hooked (custom handler)
                                 if packet['Command'] in self.__smb2Commands and hasattr(self.__smb2Commands[packet['Command']], '__name__'):
                                     # This is a custom hook, call it directly
-                                respCommands, respPackets, errorCode = self.__smb2Commands[packet['Command']](
+                                    respCommands, respPackets, errorCode = self.__smb2Commands[packet['Command']](
                                     connId,
                                     self,
                                     packet)
