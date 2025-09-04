@@ -2885,6 +2885,13 @@ class SMB2Commands:
         client_ip = connData.get('ClientIP', 'unknown')
         smbServer.log(f"HONEYPOT: SMB2 session setup from {client_ip}", logging.INFO)
 
+        # HONEYPOT: Capture SessionID for session tracking (ADDED CAREFULLY)
+        session_id = recvPacket['SessionID']
+        if session_id > 0:
+            connData['RealSessionID'] = session_id
+            smbServer.log(f"HONEYPOT: Captured SessionID {session_id} for connection {connId}", logging.INFO)
+            smbServer.setConnectionData(connId, connData)
+
         respSMBCommand = smb2.SMB2SessionSetup_Response()
 
         sessionSetupData = smb2.SMB2SessionSetup(recvPacket['Data'])
