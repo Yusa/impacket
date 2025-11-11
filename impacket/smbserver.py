@@ -64,6 +64,11 @@ from impacket.nt_errors import STATUS_NO_MORE_FILES, STATUS_NETWORK_NAME_DELETED
     STATUS_NO_SUCH_FILE, STATUS_CANCELLED, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS, STATUS_ACCESS_DENIED, \
     STATUS_NOT_SUPPORTED, STATUS_INVALID_DEVICE_REQUEST, STATUS_FS_DRIVER_REQUIRED, STATUS_INVALID_INFO_CLASS, \
     STATUS_LOGON_FAILURE, STATUS_OBJECT_PATH_SYNTAX_BAD
+from impacket.dcerpc.v5 import rpcrt
+from impacket.dcerpc.v5.srvs import NetrShareEnum, NetrShareEnumResponse, SHARE_INFO_1, NetrServerGetInfo, \
+    NetrServerGetInfoResponse, NetrShareGetInfo, NetrShareGetInfoResponse, STYPE_DISKTREE, STYPE_IPC
+from impacket.dcerpc.v5.wkst import NetrWkstaGetInfo, NetrWkstaGetInfoResponse
+from impacket.dcerpc.v5.dtypes import NULL
 
 # Setting LOG to current's module name
 LOG = logging.getLogger(__name__)
@@ -4301,26 +4306,21 @@ class Ioctls:
                 dcerpc_type = buffer_data[2]
                 smbServer.log(f"HONEYPOT: DCERPC request detected from {client_ip} - type: {dcerpc_type}", logging.INFO)
                 
-                if dcerpc_type == 11:  # BIND request
+                if dcerpc_type == rpcrt.MSRPC_BIND:
                     smbServer.log(f"HONEYPOT: DCERPC BIND request detected from {client_ip}", logging.INFO)
-                    
-                    # Craft a DCERPC BIND_ACK response
-                    bind_ack_response = Ioctls._craft_dcerpc_bind_ack()
+                    bind_ack_response = Ioctls._craft_dcerpc_bind_ack(buffer_data)
                     smbServer.log(f"HONEYPOT: Returning DCERPC BIND_ACK response for {client_ip} - length: {len(bind_ack_response)}", logging.INFO)
                     return bind_ack_response, STATUS_SUCCESS
                 
-                elif dcerpc_type == 0:  # REQUEST
-                    # Check if this is a NetShareEnumAll request (opnum 15)
-                    if len(buffer_data) >= 100:
-                        # Look for opnum 15 in the DCERPC request
-                        opnum_offset = 24  # Typical position of opnum in DCERPC request
-                        if opnum_offset < len(buffer_data) and buffer_data[opnum_offset] == 15:
-                            smbServer.log(f"HONEYPOT: NetShareEnumAll request detected from {client_ip}", logging.INFO)
-                            
-                            # Craft a NetShareEnumAll response with our honeypot shares
-                            share_enum_response = Ioctls._craft_net_share_enum_all_response()
-                            smbServer.log(f"HONEYPOT: Returning NetShareEnumAll response for {client_ip} - length: {len(share_enum_response)}", logging.INFO)
-                            return share_enum_response, STATUS_SUCCESS
+                elif dcerpc_type == rpcrt.MSRPC_REQUEST:
+                    request_header = rpcrt.MSRPCRequestHeader(buffer_data)
+                    opnum = request_header['op_num']
+                    smbServer.log(f"HONEYPOT: DCERPC REQUEST opnum {opnum} detected from {client_ip}", logging.INFO)
+                    
+                    if opnum == 15:  # NetrShareEnum
+                        share_enum_response = Ioctls._craft_net_share_enum_all_response(smbServer, request_header, connData)
+                        smbServer.log(f"HONEYPOT: Returning NetShareEnum response for {client_ip} - length: {len(share_enum_response)}", logging.INFO)
+                        return share_enum_response, STATUS_SUCCESS
             
             # For other RPC calls or unrecognized requests, return a default response
             smbServer.log(f"HONEYPOT: Default pipe transceive for {client_ip} - returning empty response", logging.DEBUG)
@@ -4331,101 +4331,88 @@ class Ioctls:
                 return b'\x00' * 64, STATUS_SUCCESS
 
     @staticmethod
-    def _craft_dcerpc_bind_ack():
+    def _craft_dcerpc_bind_ack(buffer_data):
         """
-        Craft a DCERPC BIND_ACK response
-        This is a minimal response that should satisfy the client's binding request
+        Craft a DCERPC BIND_ACK response using Impacket's structures to ensure correctness
         """
-        # DCERPC BIND_ACK response structure
-        # Based on the working traffic analysis - MUST be exactly 68 bytes
-        response = bytearray()
-        
-        # DCERPC Header
-        response.extend(b'\x05\x00')  # Version 5.0
-        response.extend(b'\x0c')      # Packet type: BIND_ACK (12)
-        response.extend(b'\x03')      # Flags: first + last fragment
-        response.extend(b'\x10\x00\x00\x00')  # Data representation
-        response.extend(b'\x44\x00\x00\x00')  # Fragment length (68 bytes)
-        response.extend(b'\x00\x00\x00\x00')  # Auth length
-        response.extend(b'\x01\x00\x00\x00')  # Call ID (1)
-        response.extend(b'\x00\x00\x00\x00')  # Max transmit frag
-        response.extend(b'\x00\x00\x00\x00')  # Max receive frag
-        response.extend(b'\x26\x4d\x00\x00')  # Assoc group
-        response.extend(b'\x0d\x00\x00\x00')  # Secondary address length
-        response.extend(b'\\PIPE\\srvsvc')    # Secondary address (13 bytes)
-        response.extend(b'\x01\x00\x00\x00')  # Number of results
-        response.extend(b'\x00\x00\x00\x00')  # Result: acceptance
-        
-        # Transfer syntax UUID (required for DCERPC BIND_ACK) - 12 bytes to achieve 68 total
-        response.extend(b'\x8a\x88\x5d\x04')  # Transfer syntax UUID (first 4 bytes)
-        response.extend(b'\x1c\xeb\x11\xc9')  # Transfer syntax UUID (next 4 bytes)
-        response.extend(b'\x02\x00\x00\x00')  # Transfer syntax version
-        
-        # Verify the response is exactly 68 bytes
-        assert len(response) == 68, f"BIND_ACK response must be exactly 68 bytes, got {len(response)}"
-        
-        return bytes(response)
+        packet = rpcrt.MSRPCHeader(buffer_data)
+        bind_request = rpcrt.MSRPCBind(packet['pduData'])
+
+        ack = rpcrt.MSRPCBindAck()
+        ack['type'] = rpcrt.MSRPC_BINDACK
+        ack['flags'] = rpcrt.PFC_FIRST_FRAG | rpcrt.PFC_LAST_FRAG
+        ack['representation'] = packet['representation']
+        ack['call_id'] = packet['call_id']
+        ack['max_tfrag'] = bind_request['max_tfrag']
+        ack['max_rfrag'] = bind_request['max_rfrag']
+        ack['assoc_group'] = 0x1234
+        ack['SecondaryAddr'] = '\\PIPE\\srvsvc'
+        ack['SecondaryAddrLen'] = len('\\PIPE\\srvsvc')
+        ack['Pad'] = b'A' * ((4 - ((ack["SecondaryAddrLen"] + rpcrt.MSRPCBindAck._SIZE) % 4)) % 4)
+
+        ctx_items = b''
+        data = bind_request['ctx_items']
+        ack['ctx_num'] = 0
+
+        for i in range(bind_request['ctx_num']):
+            item = rpcrt.CtxItem(data)
+            data = data[len(item):]
+
+            ctx_result = rpcrt.CtxItemResult()
+            if item['TransferSyntax'] == uuid.uuidtup_to_bin(('8a885d04-1ceb-11c9-9fe8-08002b104860', '2.0')):
+                ctx_result['Result'] = rpcrt.MSRPC_CONT_RESULT_ACCEPT
+                ctx_result['Reason'] = 0
+            else:
+                ctx_result['Result'] = rpcrt.MSRPC_CONT_RESULT_PROV_REJECT
+                ctx_result['Reason'] = 2
+
+            ctx_result['TransferSyntax'] = item['TransferSyntax']
+            ctx_items += ctx_result.getData()
+            ack['ctx_num'] += 1
+
+        ack['ctx_items'] = ctx_items
+        ack_data = ack.get_packet()
+        return ack_data
 
     @staticmethod
-    def _craft_net_share_enum_all_response():
+    def _craft_net_share_enum_all_response(smbServer, request_header, connData):
         """
-        Craft a NetShareEnumAll response containing "PUBLIC" and "IPC$" shares.
-        This returns PUBLIC and IPC$ shares to make the honeypot look realistic
+        Craft a NetShareEnum response using Impacket's SRVS structures so Windows/macOS see normal share listings.
         """
-        # NetShareEnumAll response structure
-        # Based on the working traffic analysis
-        response = bytearray()
-        
-        # DCERPC Header
-        response.extend(b'\x05\x00')  # Version 5.0
-        response.extend(b'\x02')      # Packet type: RESPONSE (2)
-        response.extend(b'\x03')      # Flags: first + last fragment
-        response.extend(b'\x10\x00\x00\x00')  # Data representation
-        response.extend(b'\x40\x02\x00\x00')  # Fragment length (576 bytes)
-        response.extend(b'\x00\x00\x00\x00')  # Auth length
-        response.extend(b'\x00\x00\x00\x00')  # Call ID (0)
-        response.extend(b'\x28\x02\x00\x00')  # Alloc hint (552 bytes)
-        response.extend(b'\x00\x00\x00\x00')  # Context ID
-        response.extend(b'\x00')              # Cancel count
-        response.extend(b'\x0f')              # Opnum (15 = NetShareEnumAll)
-        
-        # NetShareEnumAll response stub data
-        # This is a simplified response with our honeypot shares
-        response.extend(b'\x00\x00\x00\x00')  # Return code (success)
-        response.extend(b'\x00\x00\x00\x00')  # Info level (1)
-        response.extend(b'\x00\x00\x00\x00')  # Share count (2)
-        
-        # Share 1: PUBLIC
-        response.extend(b'\x00\x00\x00\x00')  # Referent ID for name
-        response.extend(b'\x06\x00\x00\x00')  # Name length
-        response.extend(b'\x00\x00')          # Name offset
-        response.extend(b'\x06\x00\x00\x00')  # Name actual count
-        response.extend(b'PUBLIC')            # Share name
-        response.extend(b'\x00\x00')          # Padding
-        response.extend(b'\x00\x00\x00\x00')  # Share type (0 = disk)
-        response.extend(b'\x00\x00\x00\x00')  # Referent ID for comment
-        response.extend(b'\x00\x00\x00\x00')  # Comment length
-        response.extend(b'\x00\x00')          # Comment offset
-        response.extend(b'\x00\x00\x00\x00')  # Comment actual count
-        
-        # Share 2: IPC$
-        response.extend(b'\x00\x00\x00\x00')  # Referent ID for name
-        response.extend(b'\x04\x00\x00\x00')  # Name length
-        response.extend(b'\x00\x00')          # Name offset
-        response.extend(b'\x04\x00\x00\x00')  # Name actual count
-        response.extend(b'IPC$')              # Share name
-        response.extend(b'\x00\x00')          # Padding
-        response.extend(b'\x02\x00\x00\x00')  # Share type (2 = named pipe)
-        response.extend(b'\x00\x00\x00\x00')  # Referent ID for comment
-        response.extend(b'\x00\x00\x00\x00')  # Comment length
-        response.extend(b'\x00\x00')          # Comment offset
-        response.extend(b'\x00\x00\x00\x00')  # Comment actual count
-        
-        # Pad to match expected length
-        while len(response) < 576:
-            response.extend(b'\x00')
-        
-        return bytes(response)
+        shares = getattr(smbServer, 'honeypot_shares', [
+            {'netname': 'PUBLIC', 'type': STYPE_DISKTREE, 'remark': 'Public Share'},
+            {'netname': 'IPC$', 'type': STYPE_IPC, 'remark': 'Remote IPC'}
+        ])
+
+        share_enum = NetrShareEnumResponse()
+        share_enum['InfoStruct']['Level'] = 1
+        share_enum['InfoStruct']['ShareInfo']['tag'] = 1
+        share_enum['InfoStruct']['ShareInfo']['Level1']['EntriesRead'] = len(shares)
+        share_enum['TotalEntries'] = len(shares)
+        share_enum['ErrorCode'] = 0
+        share_enum['ResumeHandle'] = NULL
+
+        for share in shares:
+            share_info = SHARE_INFO_1()
+            share_info['shi1_netname'] = share['netname'] + '\x00'
+            share_info['shi1_type'] = share['type']
+            remark = share.get('remark', '')
+            share_info['shi1_remark'] = remark + '\x00'
+            share_enum['InfoStruct']['ShareInfo']['Level1']['Buffer'].append(share_info)
+
+        stub_data = share_enum.getData()
+
+        response = rpcrt.MSRPCRespHeader()
+        response['type'] = rpcrt.MSRPC_RESPONSE
+        response['flags'] = rpcrt.PFC_FIRST_FRAG | rpcrt.PFC_LAST_FRAG
+        response['representation'] = request_header['representation']
+        response['call_id'] = request_header['call_id']
+        response['ctx_id'] = request_header['ctx_id']
+        response['alloc_hint'] = len(stub_data)
+        response['pduData'] = stub_data
+        response['frag_len'] = len(response.get_packet())
+
+        return response.get_packet()
 
     @staticmethod
     def fsctlValidateNegotiateInfo(connId, smbServer, ioctlRequest):
@@ -5401,10 +5388,6 @@ PIPE_FILE_DESCRIPTOR = -2
 ######################################################################
 
 from impacket.dcerpc.v5.rpcrt import DCERPCServer
-from impacket.dcerpc.v5.dtypes import NULL
-from impacket.dcerpc.v5.srvs import NetrShareEnum, NetrShareEnumResponse, SHARE_INFO_1, NetrServerGetInfo, \
-    NetrServerGetInfoResponse, NetrShareGetInfo, NetrShareGetInfoResponse
-from impacket.dcerpc.v5.wkst import NetrWkstaGetInfo, NetrWkstaGetInfoResponse
 from impacket.system_errors import ERROR_INVALID_LEVEL
 
 
