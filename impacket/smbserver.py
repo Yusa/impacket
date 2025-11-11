@@ -3956,8 +3956,10 @@ class SMB2Commands:
                         if pipe_responses:
                             content = pipe_responses.pop(0)
                             pipe_entry['PipeResponses'] = pipe_responses
+                            smbServer.log(f"HONEYPOT: Dequeued pipe response ({len(content)} bytes) for read", logging.DEBUG)
                         else:
                             content = b''
+                            smbServer.log("HONEYPOT: Pipe response queue empty, returning empty payload", logging.DEBUG)
 
                     respSMBCommand['DataOffset'] = 0x50
                     respSMBCommand['DataLength'] = len(content)
@@ -4383,9 +4385,10 @@ class Ioctls:
         ack['max_tfrag'] = bind_request['max_tfrag']
         ack['max_rfrag'] = bind_request['max_rfrag']
         ack['assoc_group'] = 0x1234
-        ack['SecondaryAddr'] = '\\PIPE\\srvsvc'
-        ack['SecondaryAddrLen'] = len('\\PIPE\\srvsvc')
-        ack['Pad'] = b'A' * ((4 - ((ack["SecondaryAddrLen"] + rpcrt.MSRPCBindAck._SIZE) % 4)) % 4)
+        secondary_addr = '\\PIPE\\srvsvc\x00'
+        ack['SecondaryAddr'] = secondary_addr
+        ack['SecondaryAddrLen'] = len(secondary_addr)
+        ack['Pad'] = b'\x00' * ((4 - ((ack["SecondaryAddrLen"] + rpcrt.MSRPCBindAck._SIZE) % 4)) % 4)
 
         ctx_items = b''
         data = bind_request['ctx_items']
@@ -4408,7 +4411,9 @@ class Ioctls:
             ack['ctx_num'] += 1
 
         ack['ctx_items'] = ctx_items
+        ack['auth_data'] = b''
         ack_data = ack.get_packet()
+        logging.getLogger('impacket.smbserver').log(logging.DEBUG, f"HONEYPOT: Crafted BIND_ACK payload ({len(ack_data)} bytes): {ack_data.hex()}")
         return ack_data
 
     @staticmethod
