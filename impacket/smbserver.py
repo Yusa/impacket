@@ -3575,7 +3575,9 @@ class SMB2Commands:
                 infoRecord = None
                 try:
                     if fileHandle == PIPE_FILE_DESCRIPTOR:
-                        connData['OpenedFiles'][fileID]['Socket'].close()
+                        sock = connData['OpenedFiles'][fileID].get('Socket')
+                        if sock:
+                            sock.close()
                     elif fileHandle != VOID_FILE_DESCRIPTOR:
                         os.close(fileHandle)
                         infoRecord, errorCode = queryFileInformation(os.path.dirname(pathName), os.path.basename(pathName),
@@ -3823,6 +3825,7 @@ class SMB2Commands:
 
         opened_entry = connData.get('OpenedFiles', {}).get(file_id)
         is_pipe = False
+        pipe_name = None
 
         if share_name.upper() == 'IPC$':
             is_pipe = True
@@ -3834,6 +3837,7 @@ class SMB2Commands:
                 is_pipe = True
             if opened_entry.get('VirtualPipe'):
                 is_pipe = True
+                pipe_name = opened_entry.get('PipeName', '')
             if file_name.upper().startswith('IPC$'):
                 is_pipe = True
 
@@ -3841,6 +3845,13 @@ class SMB2Commands:
         if HONEYPOT_READ_ONLY and not is_pipe:
             smbServer.log(f"HONEYPOT: BLOCKED WRITE OPERATION from {client_ip} - FileID: {file_id.hex()}", logging.WARNING)
             return [smb2.SMB2Error()], None, STATUS_ACCESS_DENIED
+
+        if is_pipe:
+            smbServer.log(f"HONEYPOT: Allowing pipe write to {pipe_name or 'unknown'} from {client_ip}", logging.INFO)
+            respSMBCommand['Count'] = writeRequest['Length']
+            respSMBCommand['Remaining'] = 0
+            smbServer.setConnectionData(connId, connData)
+            return [respSMBCommand], None, STATUS_SUCCESS
 
         if writeRequest['FileID'].getData() == b'\xff' * 16:
             # Let's take the data from the lastRequest
