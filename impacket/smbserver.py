@@ -3848,6 +3848,27 @@ class SMB2Commands:
 
         if is_pipe:
             smbServer.log(f"HONEYPOT: Allowing pipe write to {pipe_name or 'unknown'} from {client_ip}", logging.INFO)
+            if opened_entry is not None:
+                pipe_responses = opened_entry.setdefault('PipeResponses', [])
+                buffer = writeRequest['Buffer']
+                if len(buffer) >= 24 and buffer[0] == 5 and buffer[1] == 0:
+                    dcerpc_type = buffer[2]
+                    if dcerpc_type == rpcrt.MSRPC_BIND:
+                        smbServer.log(f"HONEYPOT: Captured DCERPC BIND over pipe write from {client_ip}", logging.INFO)
+                        pipe_responses.append(Ioctls._craft_dcerpc_bind_ack(buffer))
+                    elif dcerpc_type == rpcrt.MSRPC_REQUEST:
+                        try:
+                            request_header = rpcrt.MSRPCRequestHeader(buffer)
+                            opnum = request_header['op_num']
+                            smbServer.log(f"HONEYPOT: Captured DCERPC REQUEST opnum {opnum} over pipe write", logging.INFO)
+                            if opnum == 15:
+                                pipe_responses.append(
+                                    Ioctls._craft_net_share_enum_all_response(smbServer, request_header, connData)
+                                )
+                        except Exception as parse_error:
+                            smbServer.log(f"HONEYPOT: Failed to parse DCERPC request over pipe write: {parse_error}", logging.DEBUG)
+                opened_entry['PipeResponses'] = pipe_responses
+
             respSMBCommand['Count'] = writeRequest['Length']
             respSMBCommand['Remaining'] = 0
             smbServer.setConnectionData(connId, connData)
@@ -3930,8 +3951,13 @@ class SMB2Commands:
                         os.lseek(fileHandle, offset, 0)
                         content = os.read(fileHandle, readRequest['Length'])
                     else:
-                        sock = connData['OpenedFiles'][fileID]['Socket']
-                        content = sock.recv(readRequest['Length'])
+                        pipe_entry = connData['OpenedFiles'][fileID]
+                        pipe_responses = pipe_entry.get('PipeResponses', [])
+                        if pipe_responses:
+                            content = pipe_responses.pop(0)
+                            pipe_entry['PipeResponses'] = pipe_responses
+                        else:
+                            content = b''
 
                     respSMBCommand['DataOffset'] = 0x50
                     respSMBCommand['DataLength'] = len(content)
