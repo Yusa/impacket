@@ -3802,18 +3802,38 @@ class SMB2Commands:
     def smb2Write(connId, smbServer, recvPacket):
         connData = smbServer.getConnectionData(connId)
 
-        # HONEYPOT: Log SMB2 write
-        client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 write from {client_ip}", logging.INFO)
-
         respSMBCommand = smb2.SMB2Write_Response()
         writeRequest = smb2.SMB2Write(recvPacket['Data'])
 
         respSMBCommand['Buffer'] = b'\x00'
+        client_ip = connData.get('ClientIP', 'unknown')
         
-        # HONEYPOT: Block all write operations in read-only mode
-        if HONEYPOT_READ_ONLY:
-            file_id = writeRequest['FileID'].getData()
+        # HONEYPOT: Decide whether this write targets a named pipe (IPC$) or a real file
+        file_id = writeRequest['FileID'].getData()
+
+        share_info = connData.get('ConnectedShares', {}).get(recvPacket['TreeID'])
+        share_name = ''
+        if share_info:
+            share_name = str(share_info.get('shareName', ''))
+
+        opened_entry = connData.get('OpenedFiles', {}).get(file_id)
+        is_pipe = False
+
+        if share_name.upper() == 'IPC$':
+            is_pipe = True
+
+        if opened_entry:
+            file_handle = opened_entry.get('FileHandle')
+            file_name = str(opened_entry.get('FileName', ''))
+            if file_handle == PIPE_FILE_DESCRIPTOR:
+                is_pipe = True
+            if opened_entry.get('VirtualPipe'):
+                is_pipe = True
+            if file_name.upper().startswith('IPC$'):
+                is_pipe = True
+
+        # HONEYPOT: Block write operations to real files in read-only mode, but allow named pipe traffic
+        if HONEYPOT_READ_ONLY and not is_pipe:
             smbServer.log(f"HONEYPOT: BLOCKED WRITE OPERATION from {client_ip} - FileID: {file_id.hex()}", logging.WARNING)
             return [smb2.SMB2Error()], None, STATUS_ACCESS_DENIED
 
