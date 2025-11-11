@@ -4369,13 +4369,13 @@ class Ioctls:
                     opnum = request_header['op_num']
                     honeypot_log(smbServer, f"HONEYPOT: DCERPC REQUEST opnum {opnum} detected from {client_ip}", logging.INFO)
                     
-                    if opnum == 15:  # NetrShareEnum
+                    if opnum in (15, 16):  # NetrShareEnum / NetrShareEnumSticky
                         share_enum_response = Ioctls._craft_net_share_enum_all_response(smbServer, request_header, connData)
                         honeypot_log(smbServer, f"HONEYPOT: Returning NetShareEnum response for {client_ip} - length: {len(share_enum_response)}", logging.INFO)
                         return share_enum_response, STATUS_SUCCESS
             
             # For other RPC calls or unrecognized requests, return a default response
-            smbServer.log(f"HONEYPOT: Default pipe transceive for {client_ip} - returning empty response", logging.DEBUG)
+            honeypot_log(smbServer, f"HONEYPOT: Default pipe transceive for {client_ip} - returning empty response", logging.DEBUG)
             return b'\x00' * 64, STATUS_SUCCESS
             
         except Exception as e:
@@ -5182,7 +5182,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                                     self,
                                     packet)
                                     # HONEYPOT: Log hook execution
-                                    self.log(f"HONEYPOT: Custom hook executed for SMB2 command 0x{packet['Command']:02x}", logging.INFO)
+                                    honeypot_log(self, f"HONEYPOT: Custom hook executed for SMB2 command 0x{packet['Command']:02x}", logging.INFO)
                                 else:
                                     # Default handler
                                     respCommands, respPackets, errorCode = self.__smb2Commands[packet['Command']](
