@@ -4385,9 +4385,9 @@ class Ioctls:
         ack['max_tfrag'] = bind_request['max_tfrag']
         ack['max_rfrag'] = bind_request['max_rfrag']
         ack['assoc_group'] = 0x1234
-        secondary_addr = '\\PIPE\\srvsvc\x00'
+        secondary_addr = '\\PIPE\\srvsvc'
         ack['SecondaryAddr'] = secondary_addr
-        ack['SecondaryAddrLen'] = len(secondary_addr)
+        ack['SecondaryAddrLen'] = len(secondary_addr) + 1  # include terminating NULL per spec
         ack['Pad'] = b'\x00' * ((4 - ((ack["SecondaryAddrLen"] + rpcrt.MSRPCBindAck._SIZE) % 4)) % 4)
 
         ctx_items = b''
@@ -4411,8 +4411,10 @@ class Ioctls:
             ack['ctx_num'] += 1
 
         ack['ctx_items'] = ctx_items
+        ack['auth_len'] = 0
         ack['auth_data'] = b''
-        ack_data = ack.get_packet()
+        ack['frag_len'] = len(ack.getData())
+        ack_data = ack.getData()
         logging.getLogger('impacket.smbserver').log(logging.DEBUG, f"HONEYPOT: Crafted BIND_ACK payload ({len(ack_data)} bytes): {ack_data.hex()}")
         return ack_data
 
