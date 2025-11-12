@@ -4403,8 +4403,8 @@ class Ioctls:
             return b'\x00' * 64, STATUS_SUCCESS
             
         except Exception as e:
-                smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
-                return b'\x00' * 64, STATUS_SUCCESS
+            smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
+            return b'\x00' * 64, STATUS_SUCCESS
 
     @staticmethod
     def fsctlPipePeek(connId, smbServer, ioctlRequest):
@@ -4471,6 +4471,73 @@ class Ioctls:
 
         smbServer.setConnectionData(connId, connData)
         return response, STATUS_SUCCESS
+
+    @staticmethod
+    def fsctlCreateOrGetObjectId(connId, smbServer, ioctlRequest):
+        """
+        Handle FSCTL_CREATE_OR_GET_OBJECT_ID requests on files or directories.
+        Returns a FILE_OBJECTID_BUFFER (64 bytes) containing synthetic but stable IDs.
+        """
+        connData = smbServer.getConnectionData(connId)
+        client_ip = connData.get('ClientIP', 'unknown')
+        file_id = ioctlRequest['FileID'].getData()
+
+        honeypot_log(
+            smbServer,
+            f"HONEYPOT: fsctlCreateOrGetObjectId from {client_ip} - FileID: {file_id.hex()}",
+            logging.DEBUG,
+        )
+
+        opened_files = connData.get('OpenedFiles', {})
+        opened_entry = opened_files.get(file_id)
+
+        if opened_entry is None:
+            honeypot_log(
+                smbServer,
+                f"HONEYPOT: Object ID requested for unknown FileID {file_id.hex()} from {client_ip}",
+                logging.WARNING,
+            )
+            smbServer.setConnectionData(connId, connData)
+            return b'\x00' * 64, STATUS_SUCCESS
+
+        # Reuse previously generated ObjectId to remain stable across retries.
+        object_id = opened_entry.get('ObjectId')
+        if object_id is None:
+            # Derive a deterministic UUID from the file name when available, otherwise fall back to random.
+            file_name = opened_entry.get('FileName') or f"FILEID:{file_id.hex()}"
+            try:
+                object_uuid = uuid.uuid5(uuid.NAMESPACE_URL, file_name)
+            except Exception:  # pragma: no cover - extremely unlikely
+                object_uuid = uuid.uuid4()
+            object_id = object_uuid.bytes
+            opened_entry['ObjectId'] = object_id
+            opened_entry['BirthObjectId'] = object_id
+            opened_entry['BirthVolumeId'] = b'\x00' * 16
+
+        birth_volume_id = opened_entry.get('BirthVolumeId', b'\x00' * 16)
+        birth_object_id = opened_entry.get('BirthObjectId', object_id)
+        domain_id = opened_entry.get('DomainId', b'\x00' * 16)
+
+        buffer = object_id + birth_volume_id + birth_object_id + domain_id
+
+        if len(buffer) != 64:
+            honeypot_log(
+                smbServer,
+                f"HONEYPOT: Object ID buffer length mismatch ({len(buffer)}), padding to 64 bytes",
+                logging.DEBUG,
+            )
+            buffer = buffer.ljust(64, b'\x00')
+
+        honeypot_log(
+            smbServer,
+            f"HONEYPOT: Returning ObjectId {object_id.hex()} for {file_id.hex()}",
+            logging.DEBUG,
+        )
+
+        opened_entry['ObjectId'] = object_id
+        connData['OpenedFiles'][file_id] = opened_entry
+        smbServer.setConnectionData(connId, connData)
+        return buffer, STATUS_SUCCESS
 
     @staticmethod
     def _craft_dcerpc_bind_ack(buffer_data):
@@ -4894,7 +4961,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.__smb2Ioctls = {
             smb2.FSCTL_DFS_GET_REFERRALS: self.__IoctlHandler.fsctlDfsGetReferrals,
             smb2.FSCTL_PIPE_PEEK: self.__IoctlHandler.fsctlPipePeek,
-            0x000900C0: self.__IoctlHandler.fsctlPipePeek,
+            0x000900C0: self.__IoctlHandler.fsctlCreateOrGetObjectId,
             # smb2.FSCTL_PIPE_WAIT:                    self.__IoctlHandler.fsctlPipeWait,
             smb2.FSCTL_PIPE_TRANSCEIVE: self.__IoctlHandler.fsctlPipeTransceive,
             # smb2.FSCTL_SRV_COPYCHUNK:                self.__IoctlHandler.fsctlSrvCopyChunk,
