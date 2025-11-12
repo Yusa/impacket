@@ -64,11 +64,12 @@ from impacket.nt_errors import STATUS_NO_MORE_FILES, STATUS_NETWORK_NAME_DELETED
     STATUS_NO_SUCH_FILE, STATUS_CANCELLED, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS, STATUS_ACCESS_DENIED, \
     STATUS_NOT_SUPPORTED, STATUS_INVALID_DEVICE_REQUEST, STATUS_FS_DRIVER_REQUIRED, STATUS_INVALID_INFO_CLASS, \
     STATUS_LOGON_FAILURE, STATUS_OBJECT_PATH_SYNTAX_BAD
-from impacket.dcerpc.v5 import rpcrt, system_errors
+from impacket.dcerpc.v5 import rpcrt
 from impacket.dcerpc.v5.srvs import NetrShareEnum, NetrShareEnumResponse, SHARE_INFO_1, NetrServerGetInfo, \
     NetrServerGetInfoResponse, NetrShareGetInfo, NetrShareGetInfoResponse, STYPE_DISKTREE, STYPE_IPC
 from impacket.dcerpc.v5.wkst import NetrWkstaGetInfo, NetrWkstaGetInfoResponse
 from impacket.dcerpc.v5.dtypes import NULL
+from impacket.system_errors import ERROR_INVALID_LEVEL
 
 # Setting LOG to current's module name
 LOG = logging.getLogger(__name__)
@@ -4583,7 +4584,9 @@ class Ioctls:
             else:
                 response['InfoStruct']['tag'] = 1
                 response['InfoStruct']['ShareInfo1'] = NULL
-                response['ErrorCode'] = system_errors.ERROR_INVALID_LEVEL
+                response['ErrorCode'] = ERROR_INVALID_LEVEL
+            response['InfoStruct']['ShareInfo1'] = NULL
+            response['ErrorCode'] = ERROR_INVALID_LEVEL
         else:
             response['InfoStruct']['tag'] = 1
             response['InfoStruct']['ShareInfo1'] = NULL
@@ -4626,7 +4629,7 @@ class Ioctls:
         else:
             response['InfoStruct']['tag'] = 101
             response['InfoStruct']['ServerInfo101'] = NULL
-            response['ErrorCode'] = system_errors.ERROR_INVALID_LEVEL
+            response['ErrorCode'] = ERROR_INVALID_LEVEL
 
         return response.getData()
 
@@ -5627,9 +5630,6 @@ PIPE_FILE_DESCRIPTOR = -2
 ######################################################################
 
 from impacket.dcerpc.v5.rpcrt import DCERPCServer
-from impacket.system_errors import ERROR_INVALID_LEVEL
-
-
 class WKSTServer(DCERPCServer):
     def __init__(self):
         DCERPCServer.__init__(self)
