@@ -64,7 +64,7 @@ from impacket.nt_errors import STATUS_NO_MORE_FILES, STATUS_NETWORK_NAME_DELETED
     STATUS_NO_SUCH_FILE, STATUS_CANCELLED, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS, STATUS_ACCESS_DENIED, \
     STATUS_NOT_SUPPORTED, STATUS_INVALID_DEVICE_REQUEST, STATUS_FS_DRIVER_REQUIRED, STATUS_INVALID_INFO_CLASS, \
     STATUS_LOGON_FAILURE, STATUS_OBJECT_PATH_SYNTAX_BAD
-from impacket.dcerpc.v5 import rpcrt
+from impacket.dcerpc.v5 import rpcrt, system_errors
 from impacket.dcerpc.v5.srvs import NetrShareEnum, NetrShareEnumResponse, SHARE_INFO_1, NetrServerGetInfo, \
     NetrServerGetInfoResponse, NetrShareGetInfo, NetrShareGetInfoResponse, STYPE_DISKTREE, STYPE_IPC
 from impacket.dcerpc.v5.wkst import NetrWkstaGetInfo, NetrWkstaGetInfoResponse
@@ -4382,7 +4382,11 @@ class Ioctls:
                     
                     if opnum == 15:  # NetrShareEnum
                         share_enum_response = Ioctls._craft_net_share_enum_all_response(smbServer, request_header, connData)
-                        honeypot_log(smbServer, f"HONEYPOT: Returning NetrShareEnum response for {client_ip} - length: {len(share_enum_response)}", logging.INFO)
+                        honeypot_log(
+                            smbServer,
+                            f"HONEYPOT: Returning NetrShareEnum response for {client_ip} - length: {len(share_enum_response)}",
+                            logging.INFO,
+                        )
                         return share_enum_response, STATUS_SUCCESS
                     elif opnum == 16:  # NetrShareGetInfo
                         share_info_response = Ioctls._craft_net_share_get_info_response(smbServer, request_header, connData)
@@ -4400,6 +4404,72 @@ class Ioctls:
         except Exception as e:
                 smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
                 return b'\x00' * 64, STATUS_SUCCESS
+
+    @staticmethod
+    def fsctlPipePeek(connId, smbServer, ioctlRequest):
+        """
+        Handle FSCTL_PIPE_PEEK so Windows clients polling a named pipe don't hit an error loop.
+        Returns basic metadata about queued pipe responses without consuming them.
+        """
+        connData = smbServer.getConnectionData(connId)
+        client_ip = connData.get('ClientIP', 'unknown')
+
+        honeypot_log(
+            smbServer,
+            f"HONEYPOT: fsctlPipePeek from {client_ip} - CtlCode: 0x{ioctlRequest['CtlCode']:08x}",
+            logging.DEBUG,
+        )
+
+        file_id = ioctlRequest['FileID'].getData()
+        total_available = 0
+        number_of_messages = 0
+        first_message_length = 0
+        peek_payload = b''
+
+        opened_files = connData.get('OpenedFiles', {})
+        if file_id in opened_files:
+            entry = opened_files[file_id]
+            pipe_responses = entry.get('PipeResponses', [])
+            if pipe_responses:
+                number_of_messages = len(pipe_responses)
+                total_available = sum(len(chunk) for chunk in pipe_responses)
+                first_message_length = len(pipe_responses[0])
+                requested_max = ioctlRequest['MaxOutputResponse']
+                header_size = 12  # three DWORDs
+                data_budget = max(0, (requested_max or header_size + len(pipe_responses[0])) - header_size)
+                peek_payload = pipe_responses[0][:data_budget]
+                honeypot_log(
+                    smbServer,
+                    (
+                        f"HONEYPOT: Pipe peek queue for {client_ip} "
+                        f"(messages={number_of_messages}, first_len={first_message_length}, "
+                        f"total={total_available})"
+                    ),
+                    logging.DEBUG,
+                )
+            else:
+                honeypot_log(smbServer, f"HONEYPOT: Pipe peek queue empty for {client_ip}", logging.DEBUG)
+        else:
+            honeypot_log(
+                smbServer,
+                f"HONEYPOT: Pipe peek requested for unknown FileID {file_id.hex()} from {client_ip}",
+                logging.DEBUG,
+            )
+
+        header = struct.pack('<III', total_available, number_of_messages, first_message_length)
+        max_output = ioctlRequest['MaxOutputResponse']
+        if max_output and max_output < len(header):
+            response = header[:max_output]
+        else:
+            response = header
+            if max_output:
+                remaining_budget = max_output - len(header)
+                response += peek_payload[:remaining_budget]
+            else:
+                response += peek_payload
+
+        smbServer.setConnectionData(connId, connData)
+        return response, STATUS_SUCCESS
 
     @staticmethod
     def _craft_dcerpc_bind_ack(buffer_data):
@@ -4820,7 +4890,8 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
         self.__smb2Ioctls = {
             smb2.FSCTL_DFS_GET_REFERRALS: self.__IoctlHandler.fsctlDfsGetReferrals,
-            # smb2.FSCTL_PIPE_PEEK:                    self.__IoctlHandler.fsctlPipePeek,
+            smb2.FSCTL_PIPE_PEEK: self.__IoctlHandler.fsctlPipePeek,
+            0x000900C0: self.__IoctlHandler.fsctlPipePeek,
             # smb2.FSCTL_PIPE_WAIT:                    self.__IoctlHandler.fsctlPipeWait,
             smb2.FSCTL_PIPE_TRANSCEIVE: self.__IoctlHandler.fsctlPipeTransceive,
             # smb2.FSCTL_SRV_COPYCHUNK:                self.__IoctlHandler.fsctlSrvCopyChunk,
