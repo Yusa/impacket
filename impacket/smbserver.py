@@ -3840,7 +3840,7 @@ class SMB2Commands:
         client_ip = connData.get('ClientIP', 'unknown')
         
         # HONEYPOT: Decide whether this write targets a named pipe (IPC$) or a real file
-            file_id = writeRequest['FileID'].getData()
+        file_id = writeRequest['FileID'].getData()
 
         share_info = connData.get('ConnectedShares', {}).get(recvPacket['TreeID'])
         share_name = ''
@@ -4383,7 +4383,7 @@ class Ioctls:
                     if opnum == 15:  # NetrShareEnum
                         share_enum_response = Ioctls._craft_net_share_enum_all_response(smbServer, request_header, connData)
                         honeypot_log(smbServer, f"HONEYPOT: Returning NetrShareEnum response for {client_ip} - length: {len(share_enum_response)}", logging.INFO)
-                            return share_enum_response, STATUS_SUCCESS
+                        return share_enum_response, STATUS_SUCCESS
                     elif opnum == 16:  # NetrShareGetInfo
                         share_info_response = Ioctls._craft_net_share_get_info_response(smbServer, request_header, connData)
                         honeypot_log(smbServer, f"HONEYPOT: Returning NetrShareGetInfo response for {client_ip} - length: {len(share_info_response)}", logging.INFO)
