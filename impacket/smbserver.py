@@ -106,6 +106,124 @@ def honeypot_log(smbServer, message, level=logging.INFO):
         smbServer.log(message, logging.DEBUG)
 
 
+def _parse_create_contexts(buffer: bytes):
+    """
+    Parse SMB2 create contexts from the raw request buffer.
+    Returns a list of dictionaries with 'name' and 'data' keys.
+    """
+    contexts = []
+    offset = 0
+    total_length = len(buffer)
+    while offset + 16 <= total_length:
+        next_offset, name_offset, name_length, reserved, data_offset, data_length = struct.unpack_from(
+            '<LHHHHI', buffer, offset
+        )
+
+        name_bytes = b''
+        data_bytes = b''
+
+        if name_length:
+            name_start = offset + name_offset
+            name_end = name_start + name_length
+            if name_end <= total_length:
+                name_bytes = buffer[name_start:name_end]
+
+        if data_length:
+            data_start = offset + data_offset
+            data_end = data_start + data_length
+            if data_end <= total_length:
+                data_bytes = buffer[data_start:data_end]
+
+        contexts.append({'name': name_bytes, 'data': data_bytes})
+
+        if next_offset == 0:
+            break
+        offset += next_offset
+        if offset <= 0 or offset > total_length:
+            break
+
+    return contexts
+
+
+def _build_create_context_chain(contexts):
+    """
+    Build a serialized SMB2 create context chain for the response.
+    Each context in the input list must be a dict with 'name' (bytes) and 'data' (bytes).
+    """
+    if not contexts:
+        return b''
+
+    serialized = []
+    total_ctx = len(contexts)
+
+    for index, ctx in enumerate(contexts):
+        name_bytes = ctx['name'] if isinstance(ctx['name'], bytes) else bytes(ctx['name'])
+        data_bytes = ctx['data'] if isinstance(ctx['data'], bytes) else bytes(ctx['data'])
+
+        header_size = 16
+        name_offset = header_size
+        name_length = len(name_bytes)
+        pad_after_name = (8 - ((name_offset + name_length) % 8)) % 8
+        data_offset = name_offset + name_length + pad_after_name
+        data_length = len(data_bytes)
+        pad_after_data = (8 - ((data_offset + data_length) % 8)) % 8
+        total_length = data_offset + data_length + pad_after_data
+        next_offset = total_length if index < total_ctx - 1 else 0
+
+        header = struct.pack(
+            '<LHHHHI',
+            next_offset,
+            name_offset,
+            name_length,
+            0,
+            data_offset,
+            data_length
+        )
+
+        context_body = (
+            name_bytes +
+            (b'\x00' * pad_after_name) +
+            data_bytes +
+            (b'\x00' * pad_after_data)
+        )
+
+        serialized.append(header + context_body)
+
+    return b''.join(serialized)
+
+
+def _ensure_object_id_metadata(entry, canonical_path, file_id_bytes, share_name):
+    """
+    Ensure the opened file entry contains the metadata required for object ID responses.
+    """
+    if canonical_path and 'CanonicalPath' not in entry:
+        entry['CanonicalPath'] = canonical_path
+
+    if share_name is not None and 'ShareName' not in entry:
+        entry['ShareName'] = share_name
+
+    if file_id_bytes and 'FileIdBytes' not in entry:
+        entry['FileIdBytes'] = file_id_bytes
+
+    path_seed = canonical_path or f"FILEID:{file_id_bytes.hex() if file_id_bytes else ''}"
+    if 'ObjectId' not in entry or not entry['ObjectId']:
+        object_uuid = uuid.uuid5(uuid.NAMESPACE_URL, f"object:{path_seed}")
+        entry['ObjectId'] = object_uuid.bytes
+
+    if 'BirthObjectId' not in entry or not entry['BirthObjectId']:
+        entry['BirthObjectId'] = entry['ObjectId']
+
+    if 'BirthVolumeId' not in entry or not entry['BirthVolumeId']:
+        volume_seed = share_name or 'default'
+        volume_uuid = uuid.uuid5(uuid.NAMESPACE_URL, f"volume:{volume_seed}")
+        entry['BirthVolumeId'] = volume_uuid.bytes
+
+    if 'DomainId' not in entry or not entry['DomainId']:
+        entry['DomainId'] = b'\x00' * 16
+
+    return entry
+
+
 # Utility functions
 # and general functions.
 # There are some common functions that can be accessed from more than one SMB
@@ -3242,6 +3360,15 @@ class SMB2Commands:
         respSMBCommand = smb2.SMB2Create_Response()
 
         ntCreateRequest = smb2.SMB2Create(recvPacket['Data'])
+        request_contexts = []
+        request_context_names = {}
+        if ntCreateRequest['CreateContextsLength']:
+            raw_context_buffer = ntCreateRequest['Buffer'][:ntCreateRequest['CreateContextsLength']]
+            request_contexts = _parse_create_contexts(raw_context_buffer)
+            request_context_names = {
+                ctx['name'].decode('ascii', errors='ignore'): ctx for ctx in request_contexts
+                if ctx['name']
+            }
 
         respSMBCommand['Buffer'] = b'\x00'
         # Get the Tid associated
@@ -3360,6 +3487,38 @@ class SMB2Commands:
                     connData['OpenedFiles'][file_id_bytes]['Open']['EnumerationSearchPattern'] = ''
                     connData['OpenedFiles'][file_id_bytes]['VirtualPipe'] = True
                     connData['OpenedFiles'][file_id_bytes]['PipeName'] = fileName
+                    connData['OpenedFiles'][file_id_bytes]['ShareName'] = share_name or 'IPC$'
+                    connData['OpenedFiles'][file_id_bytes]['CanonicalPath'] = f"IPC$\\{fileName}"
+                    connData['OpenedFiles'][file_id_bytes]['FileIdBytes'] = file_id_bytes
+
+                    entry_meta = _ensure_object_id_metadata(
+                        connData['OpenedFiles'][file_id_bytes],
+                        f"IPC$\\{fileName}",
+                        file_id_bytes,
+                        share_name or 'IPC$'
+                    )
+
+                    response_contexts = []
+                    if 'QFid' in request_context_names:
+                        qfid_data = entry_meta['ObjectId'] + entry_meta['BirthVolumeId']
+                        response_contexts.append({'name': b'QFid', 'data': qfid_data})
+                    if 'MxAc' in request_context_names:
+                        maximal_access_response = smb2.SMB2_CREATE_QUERY_MAXIMAL_ACCESS_RESPONSE()
+                        maximal_access_response['QueryStatus'] = 0
+                        maximal_access_response['MaximalAccess'] = smb2.GENERIC_READ
+                        response_contexts.append({'name': b'MxAc', 'data': maximal_access_response.getData()})
+
+                    if response_contexts:
+                        context_buffer = _build_create_context_chain(response_contexts)
+                        respSMBCommand['CreateContextsOffset'] = respSMBCommand['StructureSize'] + 64
+                        respSMBCommand['CreateContextsLength'] = len(context_buffer)
+                        respSMBCommand['AlignPad'] = b''
+                        respSMBCommand['Buffer'] = context_buffer
+                    else:
+                        respSMBCommand['CreateContextsOffset'] = 0
+                        respSMBCommand['CreateContextsLength'] = 0
+                        respSMBCommand['AlignPad'] = b''
+                        respSMBCommand['Buffer'] = b''
                     
                     # Log successful virtual named pipe creation
                     honeypot_log(smbServer, f"HONEYPOT: Virtual named pipe created: {fileName} (FileID: {file_id_bytes.hex()})", logging.DEBUG)
@@ -3550,12 +3709,44 @@ class SMB2Commands:
                 connData['OpenedFiles'][fakefid] = {}
                 connData['OpenedFiles'][fakefid]['FileHandle'] = fid
                 connData['OpenedFiles'][fakefid]['FileName'] = pathName
+                connData['OpenedFiles'][fakefid]['ShareName'] = share_name or ''
+                connData['OpenedFiles'][fakefid]['CanonicalPath'] = pathName
+                connData['OpenedFiles'][fakefid]['FileIdBytes'] = fakefid
                 connData['OpenedFiles'][fakefid]['DeleteOnClose'] = deleteOnClose
                 connData['OpenedFiles'][fakefid]['Open'] = {}
                 connData['OpenedFiles'][fakefid]['Open']['EnumerationLocation'] = 0
                 connData['OpenedFiles'][fakefid]['Open']['EnumerationSearchPattern'] = ''
                 if fid == PIPE_FILE_DESCRIPTOR:
                     connData['OpenedFiles'][fakefid]['Socket'] = sock
+
+                entry_meta = _ensure_object_id_metadata(
+                    connData['OpenedFiles'][fakefid],
+                    pathName,
+                    fakefid,
+                    share_name or ''
+                )
+
+                response_contexts = []
+                if 'QFid' in request_context_names:
+                    qfid_data = entry_meta['ObjectId'] + entry_meta['BirthVolumeId']
+                    response_contexts.append({'name': b'QFid', 'data': qfid_data})
+                if 'MxAc' in request_context_names:
+                    maximal_access_response = smb2.SMB2_CREATE_QUERY_MAXIMAL_ACCESS_RESPONSE()
+                    maximal_access_response['QueryStatus'] = 0
+                    maximal_access_response['MaximalAccess'] = smb2.GENERIC_READ
+                    response_contexts.append({'name': b'MxAc', 'data': maximal_access_response.getData()})
+
+                if response_contexts:
+                    context_buffer = _build_create_context_chain(response_contexts)
+                    respSMBCommand['CreateContextsOffset'] = respSMBCommand['StructureSize'] + 64
+                    respSMBCommand['CreateContextsLength'] = len(context_buffer)
+                    respSMBCommand['AlignPad'] = b''
+                    respSMBCommand['Buffer'] = context_buffer
+                else:
+                    respSMBCommand['CreateContextsOffset'] = 0
+                    respSMBCommand['CreateContextsLength'] = 0
+                    respSMBCommand['AlignPad'] = b''
+                    respSMBCommand['Buffer'] = b''
         else:
             respSMBCommand = smb2.SMB2Error()
 
@@ -4403,8 +4594,8 @@ class Ioctls:
             return b'\x00' * 64, STATUS_SUCCESS
             
         except Exception as e:
-                smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
-                return b'\x00' * 64, STATUS_SUCCESS
+            smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
+            return b'\x00' * 64, STATUS_SUCCESS
 
     @staticmethod
     def fsctlPipePeek(connId, smbServer, ioctlRequest):
@@ -4482,58 +4673,39 @@ class Ioctls:
         client_ip = connData.get('ClientIP', 'unknown')
         file_id = ioctlRequest['FileID'].getData()
 
-        honeypot_log(
-            smbServer,
-            f"HONEYPOT: fsctlCreateOrGetObjectId from {client_ip} - FileID: {file_id.hex()}",
-            logging.DEBUG,
-        )
-
         opened_files = connData.get('OpenedFiles', {})
         opened_entry = opened_files.get(file_id)
 
         if opened_entry is None:
-            honeypot_log(
-                smbServer,
+            smbServer.log(
                 f"HONEYPOT: Object ID requested for unknown FileID {file_id.hex()} from {client_ip}",
                 logging.WARNING,
             )
-            # Return a deterministic buffer anyway to keep the client happy.
-            object_id = uuid.uuid4().bytes
-            buffer = object_id + (b'\x00' * 48)
+            orphan_object_id = uuid.uuid4().bytes
+            buffer = orphan_object_id + (b'\x00' * 16) + orphan_object_id + (b'\x00' * 16)
+            smbServer.setConnectionData(connId, connData)
             return buffer, STATUS_SUCCESS
 
         try:
-            # Normalise file name for deterministic generation.
-            raw_name = opened_entry.get('FileName') or f"FILEID:{file_id.hex()}"
+            raw_name = opened_entry.get('FileName') or opened_entry.get('CanonicalPath') or f"FILEID:{file_id.hex()}"
             if isinstance(raw_name, bytes):
                 file_name = raw_name.decode('utf-8', errors='ignore')
             else:
                 file_name = str(raw_name)
 
-            object_id = opened_entry.get('ObjectId')
-            if object_id is None:
-                namespace_seed = f"{file_name}|{file_id.hex()}"
-                object_uuid = uuid.uuid5(uuid.NAMESPACE_URL, namespace_seed)
-                object_id = object_uuid.bytes
-                opened_entry['ObjectId'] = object_id
+            share_name = opened_entry.get('ShareName', '')
+            opened_entry = _ensure_object_id_metadata(opened_entry, file_name, file_id, share_name)
 
-            if opened_entry.get('BirthVolumeId') is None:
-                opened_entry['BirthVolumeId'] = uuid.uuid4().bytes
-            if opened_entry.get('BirthObjectId') is None:
-                opened_entry['BirthObjectId'] = object_id
-            if opened_entry.get('DomainId') is None:
-                opened_entry['DomainId'] = b'\x00' * 16
-
+            object_id = opened_entry['ObjectId']
             birth_volume_id = opened_entry['BirthVolumeId']
             birth_object_id = opened_entry['BirthObjectId']
             domain_id = opened_entry['DomainId']
 
             buffer = object_id + birth_volume_id + birth_object_id + domain_id
             if len(buffer) != 64:
-                buffer = buffer.ljust(64, b'\x00')
+                buffer = buffer[:64] if len(buffer) > 64 else buffer.ljust(64, b'\x00')
 
-            honeypot_log(
-                smbServer,
+            smbServer.log(
                 f"HONEYPOT: Returning ObjectId {object_id.hex()} (Volume {birth_volume_id.hex()}) for {file_id.hex()}",
                 logging.DEBUG,
             )
@@ -4542,7 +4714,8 @@ class Ioctls:
                 f"HONEYPOT: Failed to build Object ID buffer for {file_id.hex()}: {exc}",
                 logging.ERROR,
             )
-            buffer = uuid.uuid4().bytes + (b'\x00' * 48)
+            fallback = uuid.uuid4().bytes
+            buffer = fallback + (b'\x00' * 16) + fallback + (b'\x00' * 16)
 
         connData['OpenedFiles'][file_id] = opened_entry
         smbServer.setConnectionData(connId, connData)
