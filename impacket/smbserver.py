@@ -4753,7 +4753,7 @@ class Ioctls:
             data = data[len(item):]
 
             ctx_result = rpcrt.CtxItemResult()
-            if item['TransferSyntax'] == uuid.uuidtup_to_bin(('8a885d04-1ceb-11c9-9fe8-08002b104860', '2.0')):
+            if item['TransferSyntax'] == impacket_uuid.uuidtup_to_bin(('8a885d04-1ceb-11c9-9fe8-08002b104860', '2.0')):
                 ctx_result['Result'] = rpcrt.MSRPC_CONT_RESULT_ACCEPT
                 ctx_result['Reason'] = 0
             else:
