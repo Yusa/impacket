@@ -54,7 +54,9 @@ from six import b, ensure_str
 from six.moves import configparser, socketserver
 
 # For signing
-from impacket import smb, nmb, ntlm, uuid
+from impacket import smb, nmb, ntlm
+from impacket import uuid as impacket_uuid
+import uuid as std_uuid
 from impacket import smb3structs as smb2
 from impacket.spnego import SPNEGO_NegTokenInit, TypesMech, MechTypes, SPNEGO_NegTokenResp, ASN1_AID, \
     ASN1_SUPPORTED_MECH
@@ -207,7 +209,7 @@ def _ensure_object_id_metadata(entry, canonical_path, file_id_bytes, share_name)
 
     path_seed = canonical_path or f"FILEID:{file_id_bytes.hex() if file_id_bytes else ''}"
     if 'ObjectId' not in entry or not entry['ObjectId']:
-        object_uuid = uuid.uuid5(uuid.NAMESPACE_URL, f"object:{path_seed}")
+        object_uuid = std_uuid.uuid5(std_uuid.NAMESPACE_URL, f"object:{path_seed}")
         entry['ObjectId'] = object_uuid.bytes
 
     if 'BirthObjectId' not in entry or not entry['BirthObjectId']:
@@ -215,7 +217,7 @@ def _ensure_object_id_metadata(entry, canonical_path, file_id_bytes, share_name)
 
     if 'BirthVolumeId' not in entry or not entry['BirthVolumeId']:
         volume_seed = share_name or 'default'
-        volume_uuid = uuid.uuid5(uuid.NAMESPACE_URL, f"volume:{volume_seed}")
+        volume_uuid = std_uuid.uuid5(std_uuid.NAMESPACE_URL, f"volume:{volume_seed}")
         entry['BirthVolumeId'] = volume_uuid.bytes
 
     if 'DomainId' not in entry or not entry['DomainId']:
@@ -4032,7 +4034,7 @@ class SMB2Commands:
         client_ip = connData.get('ClientIP', 'unknown')
         
         # HONEYPOT: Decide whether this write targets a named pipe (IPC$) or a real file
-        file_id = writeRequest['FileID'].getData()
+        file_idfile_id = writeRequest['FileID'].getData()
 
         share_info = connData.get('ConnectedShares', {}).get(recvPacket['TreeID'])
         share_name = ''
@@ -4594,8 +4596,8 @@ class Ioctls:
             return b'\x00' * 64, STATUS_SUCCESS
             
         except Exception as e:
-            smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
-            return b'\x00' * 64, STATUS_SUCCESS
+                smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
+                return b'\x00' * 64, STATUS_SUCCESS
 
     @staticmethod
     def fsctlPipePeek(connId, smbServer, ioctlRequest):
@@ -4681,7 +4683,7 @@ class Ioctls:
                 f"HONEYPOT: Object ID requested for unknown FileID {file_id.hex()} from {client_ip}",
                 logging.WARNING,
             )
-            orphan_object_id = uuid.uuid4().bytes
+            orphan_object_id = std_uuid.uuid4().bytes
             buffer = orphan_object_id + (b'\x00' * 16) + orphan_object_id + (b'\x00' * 16)
             smbServer.setConnectionData(connId, connData)
             return buffer, STATUS_SUCCESS
@@ -4714,7 +4716,7 @@ class Ioctls:
                 f"HONEYPOT: Failed to build Object ID buffer for {file_id.hex()}: {exc}",
                 logging.ERROR,
             )
-            fallback = uuid.uuid4().bytes
+            fallback = std_uuid.uuid4().bytes
             buffer = fallback + (b'\x00' * 16) + fallback + (b'\x00' * 16)
 
         connData['OpenedFiles'][file_id] = opened_entry
