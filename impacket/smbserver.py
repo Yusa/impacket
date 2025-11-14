@@ -4634,6 +4634,33 @@ class Ioctls:
                 return b'', STATUS_SUCCESS
 
     @staticmethod
+    def fsctlPipeWait(connId, smbServer, ioctlRequest):
+        """
+        Handle FSCTL_PIPE_WAIT (0x900a8) according to MS-FSCC specification.
+        
+        FSCTL_PIPE_WAIT: Wait for a named pipe instance to become available.
+        Since our honeypot doesn't actually wait, we return success immediately.
+        This prevents Windows Explorer from retrying and entering a loop.
+        
+        Per MS-FSCC specification: The server returns STATUS_SUCCESS when the pipe
+        becomes available (immediately in our case) or the timeout expires.
+        """
+        connData = smbServer.getConnectionData(connId)
+        client_ip = connData.get('ClientIP', 'unknown')
+        
+        honeypot_log(
+            smbServer,
+            f"HONEYPOT: FSCTL_PIPE_WAIT from {client_ip} - returning success immediately",
+            logging.DEBUG,
+        )
+        
+        # FSCTL_PIPE_WAIT response: empty buffer with STATUS_SUCCESS
+        # The client interprets this as "pipe became available"
+        # Return format: (response_buffer, status_code)
+        smbServer.setConnectionData(connId, connData)
+        return b'', STATUS_SUCCESS
+
+    @staticmethod
     def fsctlPipePeek(connId, smbServer, ioctlRequest):
         """
         Handle FSCTL_PIPE_PEEK so Windows clients polling a named pipe don't hit an error loop.
@@ -5147,7 +5174,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
             smb2.FSCTL_DFS_GET_REFERRALS: self.__IoctlHandler.fsctlDfsGetReferrals,
             smb2.FSCTL_PIPE_PEEK: self.__IoctlHandler.fsctlPipePeek,
             0x000900C0: self.__IoctlHandler.fsctlCreateOrGetObjectId,
-            # smb2.FSCTL_PIPE_WAIT:                    self.__IoctlHandler.fsctlPipeWait,
+            0x000900A8: self.__IoctlHandler.fsctlPipeWait,  # FSCTL_PIPE_WAIT
             smb2.FSCTL_PIPE_TRANSCEIVE: self.__IoctlHandler.fsctlPipeTransceive,
             # smb2.FSCTL_SRV_COPYCHUNK:                self.__IoctlHandler.fsctlSrvCopyChunk,
             # smb2.FSCTL_SRV_ENUMERATE_SNAPSHOTS:      self.__IoctlHandler.fsctlSrvEnumerateSnapshots,
