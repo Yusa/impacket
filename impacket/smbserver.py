@@ -4591,13 +4591,15 @@ class Ioctls:
                         honeypot_log(smbServer, f"HONEYPOT: Returning NetrServerGetInfo response for {client_ip} - length: {len(server_info_response)}", logging.INFO)
                         return server_info_response, STATUS_SUCCESS
             
-            # For other RPC calls or unrecognized requests, return a default response
-            honeypot_log(smbServer, f"HONEYPOT: Default pipe transceive for {client_ip} - returning empty response", logging.DEBUG)
-            return b'\x00' * 64, STATUS_SUCCESS
+            # For other RPC calls or unrecognized requests, return an error
+            # DO NOT return SUCCESS - this causes Windows Explorer to retry in a loop!
+            honeypot_log(smbServer, f"HONEYPOT: Unhandled RPC call from {client_ip} - returning error to prevent retry loop", logging.DEBUG)
+            return smb2.SMB2Error(), STATUS_NOT_SUPPORTED
             
         except Exception as e:
                 smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
-                return b'\x00' * 64, STATUS_SUCCESS
+                # Return error to prevent retry loops
+                return smb2.SMB2Error(), STATUS_NOT_SUPPORTED
 
     @staticmethod
     def fsctlPipePeek(connId, smbServer, ioctlRequest):
