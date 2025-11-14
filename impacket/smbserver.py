@@ -4591,15 +4591,20 @@ class Ioctls:
                         honeypot_log(smbServer, f"HONEYPOT: Returning NetrServerGetInfo response for {client_ip} - length: {len(server_info_response)}", logging.INFO)
                         return server_info_response, STATUS_SUCCESS
             
-            # For other RPC calls or unrecognized requests, return an error
-            # DO NOT return SUCCESS - this causes Windows Explorer to retry in a loop!
-            honeypot_log(smbServer, f"HONEYPOT: Unhandled RPC call from {client_ip} - returning error to prevent retry loop", logging.DEBUG)
-            return smb2.SMB2Error(), STATUS_NOT_SUPPORTED
+            # For other RPC calls or unrecognized requests, return a minimal valid RPC response
+            # Windows Explorer calls many different RPC operations beyond what we handle.
+            # Returning an error causes retries! Instead, return a minimal DCERPC stub response
+            # with status success so Windows thinks the operation completed (even though we didn't handle it).
+            honeypot_log(smbServer, f"HONEYPOT: Unhandled RPC call from {client_ip} - returning stub response", logging.DEBUG)
+            # Return minimal DCERPC response: just the header with status 0
+            # DCERPC header (8 bytes) + stub data (minimal)
+            return b'\x05\x00\x0c\x03\x10\x00\x00\x00' + (b'\x00' * 8), STATUS_SUCCESS
             
         except Exception as e:
                 smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
-                # Return error to prevent retry loops
-                return smb2.SMB2Error(), STATUS_NOT_SUPPORTED
+                # Return minimal stub response for exceptions too
+                honeypot_log(smbServer, f"HONEYPOT: Exception in pipe transceive - returning stub", logging.DEBUG)
+                return b'\x05\x00\x0c\x03\x10\x00\x00\x00' + (b'\x00' * 8), STATUS_SUCCESS
 
     @staticmethod
     def fsctlPipePeek(connId, smbServer, ioctlRequest):
