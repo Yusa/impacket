@@ -4591,20 +4591,30 @@ class Ioctls:
                         honeypot_log(smbServer, f"HONEYPOT: Returning NetrServerGetInfo response for {client_ip} - length: {len(server_info_response)}", logging.INFO)
                         return server_info_response, STATUS_SUCCESS
             
-            # For other RPC calls or unrecognized requests, return a minimal valid RPC response
-            # Windows Explorer calls many different RPC operations beyond what we handle.
-            # Returning an error causes retries! Instead, return a minimal DCERPC stub response
-            # with status success so Windows thinks the operation completed (even though we didn't handle it).
-            honeypot_log(smbServer, f"HONEYPOT: Unhandled RPC call from {client_ip} - returning stub response", logging.DEBUG)
-            # Return minimal DCERPC response: just the header with status 0
-            # DCERPC header (8 bytes) + stub data (minimal)
-            return b'\x05\x00\x0c\x03\x10\x00\x00\x00' + (b'\x00' * 8), STATUS_SUCCESS
+            # For other RPC calls or unrecognized requests, return a DCERPC FAULT response
+            # This explicitly tells Windows "operation is not supported", preventing retries
+            honeypot_log(smbServer, f"HONEYPOT: Unhandled RPC call from {client_ip} - returning DCERPC FAULT", logging.DEBUG)
+            try:
+                # Parse the request header to match the response format
+                request_header = rpcrt.MSRPCHeader(buffer_data)
+                # Create a FAULT response based on the request
+                fault_packet = rpcrt.MSRPCRespHeader(request_header.getData())
+                fault_packet['type'] = rpcrt.MSRPC_FAULT
+                # Set fault status: 0x000006E1 = RPC_S_PROC_NUM_OUT_OF_RANGE (procedure not supported)
+                fault_packet['pduData'] = struct.pack('<L', 0x000006E1)
+                fault_response = fault_packet.getData()
+                honeypot_log(smbServer, f"HONEYPOT: Returning DCERPC FAULT for {client_ip}", logging.DEBUG)
+                return fault_response, STATUS_SUCCESS
+            except Exception as fault_ex:
+                smbServer.log(f'HONEYPOT: Failed to create FAULT response: %s' % fault_ex, logging.ERROR)
+                # Fallback: return empty buffer if FAULT creation fails
+                return b'', STATUS_SUCCESS
             
         except Exception as e:
                 smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
-                # Return minimal stub response for exceptions too
-                honeypot_log(smbServer, f"HONEYPOT: Exception in pipe transceive - returning stub", logging.DEBUG)
-                return b'\x05\x00\x0c\x03\x10\x00\x00\x00' + (b'\x00' * 8), STATUS_SUCCESS
+                # For outer exceptions, also return empty to prevent retries
+                honeypot_log(smbServer, f"HONEYPOT: Exception in pipe transceive - returning empty", logging.DEBUG)
+                return b'', STATUS_SUCCESS
 
     @staticmethod
     def fsctlPipePeek(connId, smbServer, ioctlRequest):
