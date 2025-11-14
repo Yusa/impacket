@@ -4034,7 +4034,7 @@ class SMB2Commands:
         client_ip = connData.get('ClientIP', 'unknown')
         
         # HONEYPOT: Decide whether this write targets a named pipe (IPC$) or a real file
-        file_idfile_id = writeRequest['FileID'].getData()
+        file_id = writeRequest['FileID'].getData()
 
         share_info = connData.get('ConnectedShares', {}).get(recvPacket['TreeID'])
         share_name = ''
