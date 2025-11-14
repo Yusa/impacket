@@ -4669,59 +4669,26 @@ class Ioctls:
     def fsctlCreateOrGetObjectId(connId, smbServer, ioctlRequest):
         """
         Handle FSCTL_CREATE_OR_GET_OBJECT_ID requests on files or directories.
-        Returns a FILE_OBJECTID_BUFFER (64 bytes) containing synthetic but stable IDs.
+        Return STATUS_INVALID_DEVICE_REQUEST to prevent Windows Explorer from retrying.
+        
+        REASON FOR RETURNING ERROR:
+        Windows Explorer tries to get Object IDs for file preview/thumbnail generation.
+        When we return SUCCESS, it causes a retry loop where it keeps calling QueryDir -> Ioctl -> QueryDir.
+        By returning an error, Windows Explorer gracefully falls back to other methods and doesn't retry.
         """
         connData = smbServer.getConnectionData(connId)
         client_ip = connData.get('ClientIP', 'unknown')
         file_id = ioctlRequest['FileID'].getData()
-
-        opened_files = connData.get('OpenedFiles', {})
-        opened_entry = opened_files.get(file_id)
-
-        if opened_entry is None:
-            smbServer.log(
-                f"HONEYPOT: Object ID requested for unknown FileID {file_id.hex()} from {client_ip}",
-                logging.WARNING,
-            )
-            orphan_object_id = std_uuid.uuid4().bytes
-            buffer = orphan_object_id + (b'\x00' * 16) + orphan_object_id + (b'\x00' * 16)
-            smbServer.setConnectionData(connId, connData)
-            return buffer, STATUS_SUCCESS
-
-        try:
-            raw_name = opened_entry.get('FileName') or opened_entry.get('CanonicalPath') or f"FILEID:{file_id.hex()}"
-            if isinstance(raw_name, bytes):
-                file_name = raw_name.decode('utf-8', errors='ignore')
-            else:
-                file_name = str(raw_name)
-
-            share_name = opened_entry.get('ShareName', '')
-            opened_entry = _ensure_object_id_metadata(opened_entry, file_name, file_id, share_name)
-
-            object_id = opened_entry['ObjectId']
-            birth_volume_id = opened_entry['BirthVolumeId']
-            birth_object_id = opened_entry['BirthObjectId']
-            domain_id = opened_entry['DomainId']
-
-            buffer = object_id + birth_volume_id + birth_object_id + domain_id
-            if len(buffer) != 64:
-                buffer = buffer[:64] if len(buffer) > 64 else buffer.ljust(64, b'\x00')
-
-            smbServer.log(
-                f"HONEYPOT: Returning ObjectId {object_id.hex()} (Volume {birth_volume_id.hex()}) for {file_id.hex()}",
-                logging.DEBUG,
-            )
-        except Exception as exc:
-            smbServer.log(
-                f"HONEYPOT: Failed to build Object ID buffer for {file_id.hex()}: {exc}",
-                logging.ERROR,
-            )
-            fallback = std_uuid.uuid4().bytes
-            buffer = fallback + (b'\x00' * 16) + fallback + (b'\x00' * 16)
-
-        connData['OpenedFiles'][file_id] = opened_entry
-        smbServer.setConnectionData(connId, connData)
-        return buffer, STATUS_SUCCESS
+        
+        smbServer.log(
+            f"HONEYPOT: FSCTL_CREATE_OR_GET_OBJECT_ID rejected for FileID {file_id.hex()} from {client_ip} (prevents Windows Explorer retry loop)",
+            logging.DEBUG,
+        )
+        
+        # Return error to prevent Windows Explorer from retrying
+        # STATUS_INVALID_DEVICE_REQUEST = 0xC0000010
+        # This tells Windows Explorer: "this filesystem doesn't support Object IDs"
+        return b'', 0xC0000010
 
     @staticmethod
     def _craft_dcerpc_bind_ack(buffer_data):
