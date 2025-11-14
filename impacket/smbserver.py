@@ -4685,10 +4685,10 @@ class Ioctls:
             logging.DEBUG,
         )
         
-        # Return error to prevent Windows Explorer from retrying
+        # Return SMB2Error for error responses (required by smb2Ioctl handler)
         # STATUS_INVALID_DEVICE_REQUEST = 0xC0000010
         # This tells Windows Explorer: "this filesystem doesn't support Object IDs"
-        return b'', 0xC0000010
+        return smb2.SMB2Error(), 0xC0000010
 
     @staticmethod
     def _craft_dcerpc_bind_ack(buffer_data):
