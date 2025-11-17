@@ -3752,8 +3752,24 @@ class SMB2Commands:
         else:
             respSMBCommand = smb2.SMB2Error()
 
-        if errorCode == STATUS_SUCCESS:
-            connData['LastRequest']['SMB2_CREATE'] = respSMBCommand
+            if errorCode == STATUS_SUCCESS:
+                connData['LastRequest']['SMB2_CREATE'] = respSMBCommand
+                
+                # HONEYPOT: Send file access alert on file creation
+                try:
+                    client_ip = connData.get('ClientIP', 'unknown')
+                    username = connData.get('UserName', 'unknown')
+                    if hasattr(smbServer, 'send_file_access_alert'):
+                        smbServer.send_file_access_alert(
+                            src_ip=client_ip,
+                            username=username,
+                            filename=fileName,
+                            operation='create',
+                            success=True
+                        )
+                except Exception as alert_e:
+                    smbServer.log(f'HONEYPOT: Failed to send file creation alert: {alert_e}', logging.ERROR)
+                    
         smbServer.setConnectionData(connId, connData)
 
         return [respSMBCommand], None, errorCode
@@ -4183,6 +4199,23 @@ class SMB2Commands:
                     respSMBCommand['DataLength'] = len(content)
                     respSMBCommand['DataRemaining'] = 0
                     respSMBCommand['Buffer'] = content
+                    
+                    # HONEYPOT: Send file access alert on successful read
+                    if fileHandle != PIPE_FILE_DESCRIPTOR and len(content) > 0:
+                        try:
+                            filename = connData['OpenedFiles'][fileID].get('FileName', 'unknown')
+                            username = connData.get('UserName', 'unknown')
+                            if hasattr(smbServer, 'send_file_access_alert'):
+                                smbServer.send_file_access_alert(
+                                    src_ip=client_ip,
+                                    username=username,
+                                    filename=filename,
+                                    operation='read',
+                                    success=True
+                                )
+                        except Exception as alert_e:
+                            smbServer.log(f'HONEYPOT: Failed to send file access alert: {alert_e}', logging.ERROR)
+                            
                 except Exception as e:
                     smbServer.log('SMB2_READ: %s ' % e, logging.ERROR)
                     errorCode = STATUS_ACCESS_DENIED
