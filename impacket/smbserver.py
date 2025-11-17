@@ -3252,6 +3252,17 @@ class SMB2Commands:
                     )
                 except Exception as e:
                     print("[!] Could not call auth_callback: %s" % e)
+            
+            # HONEYPOT: Track authenticated session -> username mapping
+            if errorCode == STATUS_SUCCESS and errorCode != STATUS_ACCESS_DENIED:
+                try:
+                    username = authenticateMessage['user_name'].decode('utf-16le')
+                    uid = connData.get('Uid')
+                    if hasattr(smbServer, 'honeypot_session_users') and uid:
+                        smbServer.honeypot_session_users[uid] = username
+                        honeypot_log(smbServer, f"HONEYPOT: Session {uid} authenticated as {username}", logging.DEBUG)
+                except Exception as e:
+                    honeypot_log(smbServer, f"HONEYPOT: Failed to track session-user mapping: {e}", logging.WARNING)
 
         else:
             raise Exception("Unknown NTLMSSP MessageType %d" % messageType)
@@ -3758,7 +3769,13 @@ class SMB2Commands:
                 # HONEYPOT: Send file access alert on file creation
                 try:
                     client_ip = connData.get('ClientIP', 'unknown')
-                    username = connData.get('UserName', 'unknown')
+                    uid = connData.get('Uid')
+                    # Look up username from session mapping
+                    if hasattr(smbServer, 'honeypot_session_users') and uid in smbServer.honeypot_session_users:
+                        username = smbServer.honeypot_session_users[uid]
+                    else:
+                        username = connData.get('UserName', 'unknown')
+                    
                     if hasattr(smbServer, 'send_file_access_alert'):
                         smbServer.send_file_access_alert(
                             src_ip=client_ip,
@@ -4204,7 +4221,13 @@ class SMB2Commands:
                     if fileHandle != PIPE_FILE_DESCRIPTOR and len(content) > 0:
                         try:
                             filename = connData['OpenedFiles'][fileID].get('FileName', 'unknown')
-                            username = connData.get('UserName', 'unknown')
+                            uid = connData.get('Uid')
+                            # Look up username from session mapping
+                            if hasattr(smbServer, 'honeypot_session_users') and uid in smbServer.honeypot_session_users:
+                                username = smbServer.honeypot_session_users[uid]
+                            else:
+                                username = connData.get('UserName', 'unknown')
+                            
                             if hasattr(smbServer, 'send_file_access_alert'):
                                 smbServer.send_file_access_alert(
                                     src_ip=client_ip,
