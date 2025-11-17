@@ -3786,6 +3786,28 @@ class SMB2Commands:
                         )
                 except Exception as alert_e:
                     smbServer.log(f'HONEYPOT: Failed to send file creation alert: {alert_e}', logging.ERROR)
+            
+            elif errorCode != STATUS_SUCCESS:
+                # HONEYPOT: Log failed create attempts (e.g., read-only violations)
+                try:
+                    client_ip = connData.get('ClientIP', 'unknown')
+                    uid = connData.get('Uid')
+                    # Look up username from session mapping
+                    if hasattr(smbServer, 'honeypot_session_users') and uid in smbServer.honeypot_session_users:
+                        username = smbServer.honeypot_session_users[uid]
+                    else:
+                        username = connData.get('UserName', 'unknown')
+                    
+                    if hasattr(smbServer, 'send_file_access_alert'):
+                        smbServer.send_file_access_alert(
+                            src_ip=client_ip,
+                            username=username,
+                            filename=fileName,
+                            operation='create',
+                            success=False
+                        )
+                except Exception as alert_e:
+                    smbServer.log(f'HONEYPOT: Failed to send file creation failure alert: {alert_e}', logging.ERROR)
                     
         smbServer.setConnectionData(connId, connData)
 
@@ -3961,6 +3983,33 @@ class SMB2Commands:
             info_type = setInfo['InfoType']
             file_info_class = setInfo['FileInfoClass']
             smbServer.log(f"HONEYPOT: BLOCKED SET_INFO OPERATION from {client_ip} - InfoType: 0x{info_type:02x}, FileInfoClass: 0x{file_info_class:02x}", logging.WARNING)
+            
+            # HONEYPOT: Send delete/modify attempt alert for file disposition changes
+            if info_type == smb2.SMB2_0_INFO_FILE and file_info_class == smb2.SMB2_FILE_DISPOSITION_INFO:
+                try:
+                    file_id_bytes = setInfo['FileID'].getData()
+                    uid = connData.get('Uid')
+                    # Look up username from session mapping
+                    if hasattr(smbServer, 'honeypot_session_users') and uid in smbServer.honeypot_session_users:
+                        username = smbServer.honeypot_session_users[uid]
+                    else:
+                        username = connData.get('UserName', 'unknown')
+                    
+                    if recvPacket['TreeID'] in connData['ConnectedShares']:
+                        if file_id_bytes in connData['OpenedFiles']:
+                            filename = connData['OpenedFiles'][file_id_bytes].get('FileName', 'unknown')
+                            
+                            if hasattr(smbServer, 'send_file_access_alert'):
+                                smbServer.send_file_access_alert(
+                                    src_ip=client_ip,
+                                    username=username,
+                                    filename=filename,
+                                    operation='delete',
+                                    success=False
+                                )
+                except Exception as alert_e:
+                    smbServer.log(f'HONEYPOT: Failed to send delete attempt alert: {alert_e}', logging.ERROR)
+            
             return [smb2.SMB2Error()], None, STATUS_ACCESS_DENIED
 
         if setInfo['FileID'].getData() == b'\xff' * 16:
@@ -4095,6 +4144,29 @@ class SMB2Commands:
         # HONEYPOT: Block write operations to real files in read-only mode, but allow named pipe traffic
         if HONEYPOT_READ_ONLY and not is_pipe:
             smbServer.log(f"HONEYPOT: BLOCKED WRITE OPERATION from {client_ip} - FileID: {file_id.hex()}", logging.WARNING)
+            
+            # HONEYPOT: Send write attempt alert
+            try:
+                uid = connData.get('Uid')
+                # Look up username from session mapping
+                if hasattr(smbServer, 'honeypot_session_users') and uid in smbServer.honeypot_session_users:
+                    username = smbServer.honeypot_session_users[uid]
+                else:
+                    username = connData.get('UserName', 'unknown')
+                
+                filename = opened_entry.get('FileName', 'unknown') if opened_entry else 'unknown'
+                
+                if hasattr(smbServer, 'send_file_access_alert'):
+                    smbServer.send_file_access_alert(
+                        src_ip=client_ip,
+                        username=username,
+                        filename=filename,
+                        operation='write',
+                        success=False
+                    )
+            except Exception as alert_e:
+                smbServer.log(f'HONEYPOT: Failed to send write blocked alert: {alert_e}', logging.ERROR)
+            
             return [smb2.SMB2Error()], None, STATUS_ACCESS_DENIED
 
         if is_pipe:
