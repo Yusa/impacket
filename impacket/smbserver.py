@@ -5077,9 +5077,6 @@ class SMBSERVERHandler(socketserver.BaseRequestHandler):
                     r.set_trailer(p.get_trailer())
                     self.__request.send(r.rawData())
                 else:
-                    # HONEYPOT: Log SMB request processing
-                    self.__SMB.log(f"HONEYPOT: Processing SMB request from {self.__ip}:{self.__port}", logging.DEBUG)
-                    
                     resp = self.__SMB.processRequest(self.__connId, p.get_trailer())
                     # Send all the packets received. Except for big transactions this should be
                     # a single packet
