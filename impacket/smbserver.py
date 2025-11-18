@@ -54,7 +54,9 @@ from six import b, ensure_str
 from six.moves import configparser, socketserver
 
 # For signing
-from impacket import smb, nmb, ntlm, uuid
+from impacket import smb, nmb, ntlm
+from impacket import uuid as impacket_uuid
+import uuid as std_uuid
 from impacket import smb3structs as smb2
 from impacket.spnego import SPNEGO_NegTokenInit, TypesMech, MechTypes, SPNEGO_NegTokenResp, ASN1_AID, \
     ASN1_SUPPORTED_MECH
@@ -64,6 +66,12 @@ from impacket.nt_errors import STATUS_NO_MORE_FILES, STATUS_NETWORK_NAME_DELETED
     STATUS_NO_SUCH_FILE, STATUS_CANCELLED, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS, STATUS_ACCESS_DENIED, \
     STATUS_NOT_SUPPORTED, STATUS_INVALID_DEVICE_REQUEST, STATUS_FS_DRIVER_REQUIRED, STATUS_INVALID_INFO_CLASS, \
     STATUS_LOGON_FAILURE, STATUS_OBJECT_PATH_SYNTAX_BAD
+from impacket.dcerpc.v5 import rpcrt
+from impacket.dcerpc.v5.srvs import NetrShareEnum, NetrShareEnumResponse, SHARE_INFO_1, NetrServerGetInfo, \
+    NetrServerGetInfoResponse, NetrShareGetInfo, NetrShareGetInfoResponse, STYPE_DISKTREE, STYPE_IPC
+from impacket.dcerpc.v5.wkst import NetrWkstaGetInfo, NetrWkstaGetInfoResponse
+from impacket.dcerpc.v5.dtypes import NULL
+from impacket.system_errors import ERROR_INVALID_LEVEL
 
 # Setting LOG to current's module name
 LOG = logging.getLogger(__name__)
@@ -74,6 +82,148 @@ STATUS_SMB_BAD_TID = 0x00050002
 
 # HONEYPOT: Read-only enforcement flag
 HONEYPOT_READ_ONLY = True
+HONEYPOT_VERBOSE_LOGGING = os.environ.get('HONEYPOT_VERBOSE_LOGGING', '').lower() in ('1', 'true', 'yes', 'on')
+HONEYPOT_DEBUG_LOGGING = os.environ.get('HONEYPOT_DEBUG_LOGGING', '').lower() in ('1', 'true', 'yes', 'on')
+
+
+def honeypot_log(smbServer, message, level=logging.INFO):
+    """
+    Centralized logging helper for honeypot messages. By default, noisy INFO-level
+    events are downgraded to DEBUG unless HONEYPOT_VERBOSE_LOGGING is enabled.
+    Warnings and errors always propagate at their original level.
+    """
+    if level >= logging.WARNING:
+        smbServer.log(message, level)
+        return
+
+    if level == logging.INFO:
+        if HONEYPOT_VERBOSE_LOGGING:
+            smbServer.log(message, logging.INFO)
+        elif HONEYPOT_DEBUG_LOGGING:
+            smbServer.log(message, logging.DEBUG)
+        return
+
+    # DEBUG or lower
+    if HONEYPOT_DEBUG_LOGGING:
+        smbServer.log(message, logging.DEBUG)
+
+
+def _parse_create_contexts(buffer: bytes):
+    """
+    Parse SMB2 create contexts from the raw request buffer.
+    Returns a list of dictionaries with 'name' and 'data' keys.
+    """
+    contexts = []
+    offset = 0
+    total_length = len(buffer)
+    while offset + 16 <= total_length:
+        next_offset, name_offset, name_length, reserved, data_offset, data_length = struct.unpack_from(
+            '<LHHHHI', buffer, offset
+        )
+
+        name_bytes = b''
+        data_bytes = b''
+
+        if name_length:
+            name_start = offset + name_offset
+            name_end = name_start + name_length
+            if name_end <= total_length:
+                name_bytes = buffer[name_start:name_end]
+
+        if data_length:
+            data_start = offset + data_offset
+            data_end = data_start + data_length
+            if data_end <= total_length:
+                data_bytes = buffer[data_start:data_end]
+
+        contexts.append({'name': name_bytes, 'data': data_bytes})
+
+        if next_offset == 0:
+            break
+        offset += next_offset
+        if offset <= 0 or offset > total_length:
+            break
+
+    return contexts
+
+
+def _build_create_context_chain(contexts):
+    """
+    Build a serialized SMB2 create context chain for the response.
+    Each context in the input list must be a dict with 'name' (bytes) and 'data' (bytes).
+    """
+    if not contexts:
+        return b''
+
+    serialized = []
+    total_ctx = len(contexts)
+
+    for index, ctx in enumerate(contexts):
+        name_bytes = ctx['name'] if isinstance(ctx['name'], bytes) else bytes(ctx['name'])
+        data_bytes = ctx['data'] if isinstance(ctx['data'], bytes) else bytes(ctx['data'])
+
+        header_size = 16
+        name_offset = header_size
+        name_length = len(name_bytes)
+        pad_after_name = (8 - ((name_offset + name_length) % 8)) % 8
+        data_offset = name_offset + name_length + pad_after_name
+        data_length = len(data_bytes)
+        pad_after_data = (8 - ((data_offset + data_length) % 8)) % 8
+        total_length = data_offset + data_length + pad_after_data
+        next_offset = total_length if index < total_ctx - 1 else 0
+
+        header = struct.pack(
+            '<LHHHHI',
+            next_offset,
+            name_offset,
+            name_length,
+            0,
+            data_offset,
+            data_length
+        )
+
+        context_body = (
+            name_bytes +
+            (b'\x00' * pad_after_name) +
+            data_bytes +
+            (b'\x00' * pad_after_data)
+        )
+
+        serialized.append(header + context_body)
+
+    return b''.join(serialized)
+
+
+def _ensure_object_id_metadata(entry, canonical_path, file_id_bytes, share_name):
+    """
+    Ensure the opened file entry contains the metadata required for object ID responses.
+    """
+    if canonical_path and 'CanonicalPath' not in entry:
+        entry['CanonicalPath'] = canonical_path
+
+    if share_name is not None and 'ShareName' not in entry:
+        entry['ShareName'] = share_name
+
+    if file_id_bytes and 'FileIdBytes' not in entry:
+        entry['FileIdBytes'] = file_id_bytes
+
+    path_seed = canonical_path or f"FILEID:{file_id_bytes.hex() if file_id_bytes else ''}"
+    if 'ObjectId' not in entry or not entry['ObjectId']:
+        object_uuid = std_uuid.uuid5(std_uuid.NAMESPACE_URL, f"object:{path_seed}")
+        entry['ObjectId'] = object_uuid.bytes
+
+    if 'BirthObjectId' not in entry or not entry['BirthObjectId']:
+        entry['BirthObjectId'] = entry['ObjectId']
+
+    if 'BirthVolumeId' not in entry or not entry['BirthVolumeId']:
+        volume_seed = share_name or 'default'
+        volume_uuid = std_uuid.uuid5(std_uuid.NAMESPACE_URL, f"volume:{volume_seed}")
+        entry['BirthVolumeId'] = volume_uuid.bytes
+
+    if 'DomainId' not in entry or not entry['DomainId']:
+        entry['DomainId'] = b'\x00' * 16
+
+    return entry
 
 
 # Utility functions
@@ -928,18 +1078,18 @@ class TRANS2Commands:
         client_ip = connData.get('ClientIP', 'unknown')
         
         # HONEYPOT: Log SMB1 TRANS2_QUERY_FS_INFORMATION
-        smbServer.log(f"HONEYPOT: SMB1 TRANS2_QUERY_FS_INFORMATION from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB1 TRANS2_QUERY_FS_INFORMATION from {client_ip}", logging.INFO)
         
         errorCode = 0
         # Get the Tid associated
         if recvPacket['Tid'] in connData['ConnectedShares']:
             # HONEYPOT: Check if this is a share enumeration request
             level = struct.unpack('<H', parameters)[0]
-            smbServer.log(f"HONEYPOT: TRANS2_QUERY_FS_INFORMATION level: 0x{level:04x} from {client_ip}", logging.DEBUG)
+            honeypot_log(smbServer, f"HONEYPOT: TRANS2_QUERY_FS_INFORMATION level: 0x{level:04x} from {client_ip}", logging.DEBUG)
             
             # Check if this is a share enumeration request (common levels for share info)
             if level in [0x0001, 0x0002, 0x0003, 0x0004, 0x0005]:  # Common FS info levels
-                smbServer.log(f"HONEYPOT: Share enumeration request detected from {client_ip} - level 0x{level:04x}", logging.INFO)
+                honeypot_log(smbServer, f"HONEYPOT: Share enumeration request detected from {client_ip} - level 0x{level:04x}", logging.INFO)
                 
                 # For share enumeration, return our honeypot share information
                 if level == 0x0003:  # SMB_QUERY_FS_ATTRIBUTE_INFO
@@ -951,7 +1101,7 @@ class TRANS2Commands:
                     fs_data['FileSystemName'] = 'NTFS'.encode('utf-16le')
                     data = fs_data.getData()
                     
-                    smbServer.log(f"HONEYPOT: Share enumeration response created for {client_ip} - NTFS filesystem", logging.INFO)
+                    honeypot_log(smbServer, f"HONEYPOT: Share enumeration response created for {client_ip} - NTFS filesystem", logging.INFO)
                 else:
                     # Use default handler for other levels
                     data = queryFsInformation(connData['ConnectedShares'][recvPacket['Tid']]['path'], '',
@@ -2827,7 +2977,7 @@ class SMB2Commands:
 
         # HONEYPOT: Log SMB2 negotiation
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 negotiation from {client_ip} - isSMB1: {isSMB1}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 negotiation from {client_ip} - isSMB1: {isSMB1}", logging.INFO)
 
         respPacket = smb2.SMB2Packet()
         respPacket['Flags'] = smb2.SMB2_FLAGS_SERVER_TO_REDIR
@@ -2883,13 +3033,13 @@ class SMB2Commands:
 
         # HONEYPOT: Log SMB2 session setup
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 session setup from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 session setup from {client_ip}", logging.INFO)
 
         # HONEYPOT: Capture SessionID for session tracking (ADDED CAREFULLY)
         session_id = recvPacket['SessionID']
         if session_id > 0:
             connData['RealSessionID'] = session_id
-            smbServer.log(f"HONEYPOT: Captured SessionID {session_id} for connection {connId}", logging.INFO)
+            honeypot_log(smbServer, f"HONEYPOT: Captured SessionID {session_id} for connection {connId}", logging.INFO)
             smbServer.setConnectionData(connId, connData)
 
         respSMBCommand = smb2.SMB2SessionSetup_Response()
@@ -3102,6 +3252,17 @@ class SMB2Commands:
                     )
                 except Exception as e:
                     print("[!] Could not call auth_callback: %s" % e)
+            
+            # HONEYPOT: Track authenticated session -> username mapping
+            if errorCode == STATUS_SUCCESS and errorCode != STATUS_ACCESS_DENIED:
+                try:
+                    username = authenticateMessage['user_name'].decode('utf-16le')
+                    uid = connData.get('Uid')
+                    if hasattr(smbServer, 'honeypot_session_users') and uid:
+                        smbServer.honeypot_session_users[uid] = username
+                        honeypot_log(smbServer, f"HONEYPOT: Session {uid} authenticated as {username}", logging.DEBUG)
+                except Exception as e:
+                    honeypot_log(smbServer, f"HONEYPOT: Failed to track session-user mapping: {e}", logging.WARNING)
 
         else:
             raise Exception("Unknown NTLMSSP MessageType %d" % messageType)
@@ -3115,7 +3276,7 @@ class SMB2Commands:
         
         # HONEYPOT: Log successful authentication
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 authentication successful for {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 authentication successful for {client_ip}", logging.INFO)
         
         # For now, just switching to nobody
         # os.setregid(65534,65534)
@@ -3130,7 +3291,7 @@ class SMB2Commands:
 
         # HONEYPOT: Log SMB2 tree connect
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 tree connect from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 tree connect from {client_ip}", logging.INFO)
 
         respPacket = smb2.SMB2Packet()
         respPacket['Flags'] = smb2.SMB2_FLAGS_SERVER_TO_REDIR
@@ -3162,7 +3323,7 @@ class SMB2Commands:
         if share is not None:
             # HONEYPOT: Log share access
             client_ip = connData.get('ClientIP', 'unknown')
-            smbServer.log(f"HONEYPOT: Share access from {client_ip} - Share: {path.upper()}, Path: {share['path']}", logging.INFO)
+            honeypot_log(smbServer, f"HONEYPOT: Share access from {client_ip} - Share: {path.upper()}, Path: {share['path']}", logging.INFO)
             
             # Simple way to generate a Tid
             if len(connData['ConnectedShares']) == 0:
@@ -3175,7 +3336,7 @@ class SMB2Commands:
             
             # HONEYPOT: Log successful share connection
             client_ip = connData.get('ClientIP', 'unknown')
-            smbServer.log(f"HONEYPOT: Share connected from {client_ip} - TreeID: {tid}, Share: {path.upper()}", logging.INFO)
+            honeypot_log(smbServer, f"HONEYPOT: Share connected from {client_ip} - TreeID: {tid}, Share: {path.upper()}", logging.INFO)
             smbServer.log("Connecting Share(%d:%s)" % (tid, path))
         else:
             # HONEYPOT: Log failed share access
@@ -3212,6 +3373,15 @@ class SMB2Commands:
         respSMBCommand = smb2.SMB2Create_Response()
 
         ntCreateRequest = smb2.SMB2Create(recvPacket['Data'])
+        request_contexts = []
+        request_context_names = {}
+        if ntCreateRequest['CreateContextsLength']:
+            raw_context_buffer = ntCreateRequest['Buffer'][:ntCreateRequest['CreateContextsLength']]
+            request_contexts = _parse_create_contexts(raw_context_buffer)
+            request_context_names = {
+                ctx['name'].decode('ascii', errors='ignore'): ctx for ctx in request_contexts
+                if ctx['name']
+            }
 
         respSMBCommand['Buffer'] = b'\x00'
         # Get the Tid associated
@@ -3230,28 +3400,28 @@ class SMB2Commands:
 
             # HONEYPOT: Log SMB2 create
             client_ip = connData.get('ClientIP', 'unknown')
-            smbServer.log(f"HONEYPOT: SMB2 create from {client_ip}", logging.INFO)
+            honeypot_log(smbServer, f"HONEYPOT: SMB2 create from {client_ip}", logging.DEBUG)
             
             # DEBUG: Simple test to verify our code is being executed
-            smbServer.log(f"HONEYPOT: DEBUG TEST - CREATE handler is working for file: {fileName}", logging.INFO)
+            honeypot_log(smbServer, f"HONEYPOT: DEBUG TEST - CREATE handler is working for file: {fileName}", logging.DEBUG)
             
             # HONEYPOT: Log CREATE request details
             desired_access = ntCreateRequest['DesiredAccess']
             create_disposition = ntCreateRequest['CreateDisposition']
             create_options = ntCreateRequest['CreateOptions']
             
-            smbServer.log(f"HONEYPOT: CREATE request from {client_ip} - File: {fileName}, Access: 0x{desired_access:08x}, Disposition: {create_disposition}, Options: 0x{create_options:08x}", logging.INFO)
+            honeypot_log(smbServer, f"HONEYPOT: CREATE request from {client_ip} - File: {fileName}, Access: 0x{desired_access:08x}, Disposition: {create_disposition}, Options: 0x{create_options:08x}", logging.DEBUG)
 
             # HONEYPOT: SECURITY - Block file access in IPC$ share while allowing named pipes
             share_name = None
             
             # DEBUG: Check what's in connData and recvPacket
-            smbServer.log(f"HONEYPOT: DEBUG - connData keys: {list(connData.keys()) if connData else 'None'}", logging.INFO)
+            honeypot_log(smbServer, f"HONEYPOT: DEBUG - connData keys: {list(connData.keys()) if connData else 'None'}", logging.DEBUG)
             
             # SAFE: Get TreeID with defensive programming
             try:
                 tree_id = recvPacket['TreeID']
-                smbServer.log(f"HONEYPOT: DEBUG - recvPacket TreeID: {tree_id}", logging.INFO)
+                honeypot_log(smbServer, f"HONEYPOT: DEBUG - recvPacket TreeID: {tree_id}", logging.DEBUG)
             except (KeyError, TypeError, AttributeError) as e:
                 smbServer.log(f"HONEYPOT: DEBUG - ERROR accessing TreeID: {e}", logging.ERROR)
                 tree_id = None
@@ -3259,15 +3429,15 @@ class SMB2Commands:
             if 'ConnectedShares' in connData and tree_id and tree_id in connData['ConnectedShares']:
                 share_info = connData['ConnectedShares'][tree_id]
                 share_name = share_info.get('shareName', '')  # Use 'shareName' not 'share'
-                smbServer.log(f"HONEYPOT: DEBUG - Found share info: {share_info}", logging.INFO)
+                honeypot_log(smbServer, f"HONEYPOT: DEBUG - Found share info: {share_info}", logging.DEBUG)
             else:
-                smbServer.log(f"HONEYPOT: DEBUG - No ConnectedShares or TreeID not found", logging.INFO)
+                honeypot_log(smbServer, f"HONEYPOT: DEBUG - No ConnectedShares or TreeID not found", logging.DEBUG)
             
             # DEBUG: Log what we're processing
-            smbServer.log(f"HONEYPOT: DEBUG - Processing CREATE for file: {fileName}, share: {share_name}, TreeID: {tree_id}", logging.INFO)
+            honeypot_log(smbServer, f"HONEYPOT: DEBUG - Processing CREATE for file: {fileName}, share: {share_name}, TreeID: {tree_id}", logging.DEBUG)
             
             if share_name == 'IPC$':
-                smbServer.log(f"HONEYPOT: DEBUG - Entered IPC$ logic for file: {fileName}", logging.DEBUG)
+                honeypot_log(smbServer, f"HONEYPOT: DEBUG - Entered IPC$ logic for file: {fileName}", logging.DEBUG)
                 
                 # Check if this is a named pipe operation (srvsvc, wkssvc, etc.)
                 is_named_pipe = (
@@ -3277,12 +3447,12 @@ class SMB2Commands:
                     fileName.startswith('PIPE\\')
                 )
                 
-                smbServer.log(f"HONEYPOT: DEBUG - is_named_pipe check result: {is_named_pipe} for {fileName}", logging.DEBUG)
+                honeypot_log(smbServer, f"HONEYPOT: DEBUG - is_named_pipe check result: {is_named_pipe} for {fileName}", logging.DEBUG)
                 
                 if is_named_pipe:
                     # HONEYPOT: Handle virtual named pipe creation for IPC$ services
                     # This allows smbutil view to work while maintaining security
-                    smbServer.log(f"HONEYPOT: HANDLING VIRTUAL IPC$ named pipe: {fileName} from {client_ip}", logging.INFO)
+                    honeypot_log(smbServer, f"HONEYPOT: HANDLING VIRTUAL IPC$ named pipe: {fileName} from {client_ip}", logging.DEBUG)
                     
                     # Create a virtual file handle for the named pipe
                     # This bypasses filesystem access and uses the registered named pipe
@@ -3330,15 +3500,47 @@ class SMB2Commands:
                     connData['OpenedFiles'][file_id_bytes]['Open']['EnumerationSearchPattern'] = ''
                     connData['OpenedFiles'][file_id_bytes]['VirtualPipe'] = True
                     connData['OpenedFiles'][file_id_bytes]['PipeName'] = fileName
+                    connData['OpenedFiles'][file_id_bytes]['ShareName'] = share_name or 'IPC$'
+                    connData['OpenedFiles'][file_id_bytes]['CanonicalPath'] = f"IPC$\\{fileName}"
+                    connData['OpenedFiles'][file_id_bytes]['FileIdBytes'] = file_id_bytes
+
+                    entry_meta = _ensure_object_id_metadata(
+                        connData['OpenedFiles'][file_id_bytes],
+                        f"IPC$\\{fileName}",
+                        file_id_bytes,
+                        share_name or 'IPC$'
+                    )
+
+                    response_contexts = []
+                    if 'QFid' in request_context_names:
+                        qfid_data = entry_meta['ObjectId'] + entry_meta['BirthVolumeId']
+                        response_contexts.append({'name': b'QFid', 'data': qfid_data})
+                    if 'MxAc' in request_context_names:
+                        maximal_access_response = smb2.SMB2_CREATE_QUERY_MAXIMAL_ACCESS_RESPONSE()
+                        maximal_access_response['QueryStatus'] = 0
+                        maximal_access_response['MaximalAccess'] = smb2.GENERIC_READ
+                        response_contexts.append({'name': b'MxAc', 'data': maximal_access_response.getData()})
+
+                    if response_contexts:
+                        context_buffer = _build_create_context_chain(response_contexts)
+                        respSMBCommand['CreateContextsOffset'] = respSMBCommand['StructureSize'] + 64
+                        respSMBCommand['CreateContextsLength'] = len(context_buffer)
+                        respSMBCommand['AlignPad'] = b''
+                        respSMBCommand['Buffer'] = context_buffer
+                    else:
+                        respSMBCommand['CreateContextsOffset'] = 0
+                        respSMBCommand['CreateContextsLength'] = 0
+                        respSMBCommand['AlignPad'] = b''
+                        respSMBCommand['Buffer'] = b''
                     
                     # Log successful virtual named pipe creation
-                    smbServer.log(f"HONEYPOT: Virtual named pipe created: {fileName} (FileID: {file_id_bytes.hex()})", logging.INFO)
-                    smbServer.log(f"HONEYPOT: Virtual named pipe stored in OpenedFiles with FileID: {file_id_bytes.hex()}", logging.DEBUG)
+                    honeypot_log(smbServer, f"HONEYPOT: Virtual named pipe created: {fileName} (FileID: {file_id_bytes.hex()})", logging.DEBUG)
+                    honeypot_log(smbServer, f"HONEYPOT: Virtual named pipe stored in OpenedFiles with FileID: {file_id_bytes.hex()}", logging.DEBUG)
                     
                     # Return success immediately - no filesystem access needed
                     # CRITICAL: Set connection data and return immediately to avoid conflicts
                     smbServer.setConnectionData(connId, connData)
-                    smbServer.log(f"HONEYPOT: Virtual named pipe creation completed successfully for {fileName}", logging.INFO)
+                    honeypot_log(smbServer, f"HONEYPOT: Virtual named pipe creation completed successfully for {fileName}", logging.DEBUG)
                     return [respSMBCommand], None, STATUS_SUCCESS
                 else:
                     # Block all file access in IPC$ share for security
@@ -3348,7 +3550,7 @@ class SMB2Commands:
             # HONEYPOT: Skip filesystem logic if we've already handled a virtual named pipe
             # This prevents conflicts between virtual named pipe handling and filesystem access
             if share_name == 'IPC$' and fileName in ['srvsvc', 'wkssvc']:
-                smbServer.log(f"HONEYPOT: Skipping filesystem logic for virtual named pipe: {fileName}", logging.INFO)
+                honeypot_log(smbServer, f"HONEYPOT: Skipping filesystem logic for virtual named pipe: {fileName}", logging.INFO)
                 # We've already handled this in the IPC$ logic above, so return success
                 return [respSMBCommand], None, STATUS_SUCCESS
             elif not isInFileJail(path, fileName):
@@ -3401,7 +3603,7 @@ class SMB2Commands:
                     # Access mask 0xc0000000 is GENERIC_READ | GENERIC_WRITE for IPC services
                     if fileName == 'srvsvc' and desiredAccess == 0xc0000000:
                         client_ip = connData.get('ClientIP', 'unknown')
-                        smbServer.log(f"HONEYPOT: ALLOWING IPC$ service creation for {fileName} from {client_ip}", logging.INFO)
+                        honeypot_log(smbServer, f"HONEYPOT: ALLOWING IPC$ service creation for {fileName} from {client_ip}", logging.INFO)
                         # Skip write access check for IPC$ services - let them through
                         pass
                     elif has_write_access:
@@ -3412,7 +3614,7 @@ class SMB2Commands:
                     
                     # HONEYPOT: Force read-only mode for all operations
                     mode = os.O_RDONLY
-                    smbServer.log(f"HONEYPOT: Enforced read-only mode for {fileName} from {connData.get('ClientIP', 'unknown')}", logging.INFO)
+                    honeypot_log(smbServer, f"HONEYPOT: Enforced read-only mode for {fileName} from {connData.get('ClientIP', 'unknown')}", logging.INFO)
                 else:
                     # Original logic (not used in honeypot mode)
                     if (desiredAccess & smb2.FILE_READ_DATA) or (desiredAccess & smb2.GENERIC_READ):
@@ -3520,17 +3722,93 @@ class SMB2Commands:
                 connData['OpenedFiles'][fakefid] = {}
                 connData['OpenedFiles'][fakefid]['FileHandle'] = fid
                 connData['OpenedFiles'][fakefid]['FileName'] = pathName
+                connData['OpenedFiles'][fakefid]['ShareName'] = share_name or ''
+                connData['OpenedFiles'][fakefid]['CanonicalPath'] = pathName
+                connData['OpenedFiles'][fakefid]['FileIdBytes'] = fakefid
                 connData['OpenedFiles'][fakefid]['DeleteOnClose'] = deleteOnClose
                 connData['OpenedFiles'][fakefid]['Open'] = {}
                 connData['OpenedFiles'][fakefid]['Open']['EnumerationLocation'] = 0
                 connData['OpenedFiles'][fakefid]['Open']['EnumerationSearchPattern'] = ''
                 if fid == PIPE_FILE_DESCRIPTOR:
                     connData['OpenedFiles'][fakefid]['Socket'] = sock
+
+                entry_meta = _ensure_object_id_metadata(
+                    connData['OpenedFiles'][fakefid],
+                    pathName,
+                    fakefid,
+                    share_name or ''
+                )
+
+                response_contexts = []
+                if 'QFid' in request_context_names:
+                    qfid_data = entry_meta['ObjectId'] + entry_meta['BirthVolumeId']
+                    response_contexts.append({'name': b'QFid', 'data': qfid_data})
+                if 'MxAc' in request_context_names:
+                    maximal_access_response = smb2.SMB2_CREATE_QUERY_MAXIMAL_ACCESS_RESPONSE()
+                    maximal_access_response['QueryStatus'] = 0
+                    maximal_access_response['MaximalAccess'] = smb2.GENERIC_READ
+                    response_contexts.append({'name': b'MxAc', 'data': maximal_access_response.getData()})
+
+                if response_contexts:
+                    context_buffer = _build_create_context_chain(response_contexts)
+                    respSMBCommand['CreateContextsOffset'] = respSMBCommand['StructureSize'] + 64
+                    respSMBCommand['CreateContextsLength'] = len(context_buffer)
+                    respSMBCommand['AlignPad'] = b''
+                    respSMBCommand['Buffer'] = context_buffer
+                else:
+                    respSMBCommand['CreateContextsOffset'] = 0
+                    respSMBCommand['CreateContextsLength'] = 0
+                    respSMBCommand['AlignPad'] = b''
+                    respSMBCommand['Buffer'] = b''
         else:
             respSMBCommand = smb2.SMB2Error()
 
-        if errorCode == STATUS_SUCCESS:
-            connData['LastRequest']['SMB2_CREATE'] = respSMBCommand
+            if errorCode == STATUS_SUCCESS:
+                connData['LastRequest']['SMB2_CREATE'] = respSMBCommand
+                
+                # HONEYPOT: Send file access alert on file creation
+                try:
+                    client_ip = connData.get('ClientIP', 'unknown')
+                    uid = connData.get('Uid')
+                    # Look up username from session mapping
+                    if hasattr(smbServer, 'honeypot_session_users') and uid in smbServer.honeypot_session_users:
+                        username = smbServer.honeypot_session_users[uid]
+                    else:
+                        username = connData.get('UserName', 'unknown')
+                    
+                    if hasattr(smbServer, 'send_file_access_alert'):
+                        smbServer.send_file_access_alert(
+                            src_ip=client_ip,
+                            username=username,
+                            filename=fileName,
+                            operation='create',
+                            success=True
+                        )
+                except Exception as alert_e:
+                    smbServer.log(f'HONEYPOT: Failed to send file creation alert: {alert_e}', logging.ERROR)
+            
+            elif errorCode != STATUS_SUCCESS:
+                # HONEYPOT: Log failed create attempts (e.g., read-only violations)
+                try:
+                    client_ip = connData.get('ClientIP', 'unknown')
+                    uid = connData.get('Uid')
+                    # Look up username from session mapping
+                    if hasattr(smbServer, 'honeypot_session_users') and uid in smbServer.honeypot_session_users:
+                        username = smbServer.honeypot_session_users[uid]
+                    else:
+                        username = connData.get('UserName', 'unknown')
+                    
+                    if hasattr(smbServer, 'send_file_access_alert'):
+                        smbServer.send_file_access_alert(
+                            src_ip=client_ip,
+                            username=username,
+                            filename=fileName,
+                            operation='create',
+                            success=False
+                        )
+                except Exception as alert_e:
+                    smbServer.log(f'HONEYPOT: Failed to send file creation failure alert: {alert_e}', logging.ERROR)
+                    
         smbServer.setConnectionData(connId, connData)
 
         return [respSMBCommand], None, errorCode
@@ -3541,7 +3819,7 @@ class SMB2Commands:
 
         # HONEYPOT: Log SMB2 close
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 close from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 close from {client_ip}", logging.INFO)
 
         respSMBCommand = smb2.SMB2Close_Response()
 
@@ -3550,7 +3828,7 @@ class SMB2Commands:
         # HONEYPOT: Log close request details
         client_ip = connData.get('ClientIP', 'unknown')
         file_id = closeRequest['FileID'].getData()
-        smbServer.log(f"HONEYPOT: CLOSE request from {client_ip} - FileID: {file_id.hex()}", logging.DEBUG)
+        honeypot_log(smbServer, f"HONEYPOT: CLOSE request from {client_ip} - FileID: {file_id.hex()}", logging.DEBUG)
 
         if closeRequest['FileID'].getData() == b'\xff' * 16:
             # Let's take the data from the lastRequest
@@ -3570,7 +3848,9 @@ class SMB2Commands:
                 infoRecord = None
                 try:
                     if fileHandle == PIPE_FILE_DESCRIPTOR:
-                        connData['OpenedFiles'][fileID]['Socket'].close()
+                        sock = connData['OpenedFiles'][fileID].get('Socket')
+                        if sock:
+                            sock.close()
                     elif fileHandle != VOID_FILE_DESCRIPTOR:
                         os.close(fileHandle)
                         infoRecord, errorCode = queryFileInformation(os.path.dirname(pathName), os.path.basename(pathName),
@@ -3606,7 +3886,7 @@ class SMB2Commands:
                         respSMBCommand['FileAttributes'] = infoRecord['FileAttributes']
                     if errorCode == STATUS_SUCCESS:
                         # HONEYPOT: Log file close
-                        smbServer.log(f"HONEYPOT: File closed from {client_ip} - File: {pathName}", logging.DEBUG)
+                        honeypot_log(smbServer, f"HONEYPOT: File closed from {client_ip} - File: {pathName}", logging.DEBUG)
                         del (connData['OpenedFiles'][fileID])
             else:
                 errorCode = STATUS_INVALID_HANDLE
@@ -3628,14 +3908,14 @@ class SMB2Commands:
 
         # HONEYPOT: Log SMB2 query info
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 query info from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 query info from {client_ip}", logging.INFO)
         
         # HONEYPOT: Fixed QueryInfo response formatting
         respSMBCommand['OutputBufferOffset'] = 0x48
         respSMBCommand['Buffer'] = b'\x00'
         
         # HONEYPOT: Log QueryInfo request details
-        smbServer.log(f"HONEYPOT: QueryInfo request from {client_ip} - InfoType: 0x{queryInfo['InfoType']:02x}, FileInfoClass: 0x{queryInfo['FileInfoClass']:02x}", logging.DEBUG)
+        honeypot_log(smbServer, f"HONEYPOT: QueryInfo request from {client_ip} - InfoType: 0x{queryInfo['InfoType']:02x}, FileInfoClass: 0x{queryInfo['FileInfoClass']:02x}", logging.DEBUG)
 
         if queryInfo['FileID'].getData() == b'\xff' * 16:
             # Let's take the data from the lastRequest
@@ -3696,13 +3976,40 @@ class SMB2Commands:
         
         # HONEYPOT: Log SMB2 set info
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 set info from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 set info from {client_ip}", logging.INFO)
         
         # HONEYPOT: Block all SET_INFO operations in read-only mode
         if HONEYPOT_READ_ONLY:
             info_type = setInfo['InfoType']
             file_info_class = setInfo['FileInfoClass']
             smbServer.log(f"HONEYPOT: BLOCKED SET_INFO OPERATION from {client_ip} - InfoType: 0x{info_type:02x}, FileInfoClass: 0x{file_info_class:02x}", logging.WARNING)
+            
+            # HONEYPOT: Send delete/modify attempt alert for file disposition changes
+            if info_type == smb2.SMB2_0_INFO_FILE and file_info_class == smb2.SMB2_FILE_DISPOSITION_INFO:
+                try:
+                    file_id_bytes = setInfo['FileID'].getData()
+                    uid = connData.get('Uid')
+                    # Look up username from session mapping
+                    if hasattr(smbServer, 'honeypot_session_users') and uid in smbServer.honeypot_session_users:
+                        username = smbServer.honeypot_session_users[uid]
+                    else:
+                        username = connData.get('UserName', 'unknown')
+                    
+                    if recvPacket['TreeID'] in connData['ConnectedShares']:
+                        if file_id_bytes in connData['OpenedFiles']:
+                            filename = connData['OpenedFiles'][file_id_bytes].get('FileName', 'unknown')
+                            
+                            if hasattr(smbServer, 'send_file_access_alert'):
+                                smbServer.send_file_access_alert(
+                                    src_ip=client_ip,
+                                    username=username,
+                                    filename=filename,
+                                    operation='delete',
+                                    success=False
+                                )
+                except Exception as alert_e:
+                    smbServer.log(f'HONEYPOT: Failed to send delete attempt alert: {alert_e}', logging.ERROR)
+            
             return [smb2.SMB2Error()], None, STATUS_ACCESS_DENIED
 
         if setInfo['FileID'].getData() == b'\xff' * 16:
@@ -3802,20 +4109,93 @@ class SMB2Commands:
     def smb2Write(connId, smbServer, recvPacket):
         connData = smbServer.getConnectionData(connId)
 
-        # HONEYPOT: Log SMB2 write
-        client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 write from {client_ip}", logging.INFO)
-
         respSMBCommand = smb2.SMB2Write_Response()
         writeRequest = smb2.SMB2Write(recvPacket['Data'])
 
         respSMBCommand['Buffer'] = b'\x00'
+        client_ip = connData.get('ClientIP', 'unknown')
         
-        # HONEYPOT: Block all write operations in read-only mode
-        if HONEYPOT_READ_ONLY:
-            file_id = writeRequest['FileID'].getData()
+        # HONEYPOT: Decide whether this write targets a named pipe (IPC$) or a real file
+        file_id = writeRequest['FileID'].getData()
+
+        share_info = connData.get('ConnectedShares', {}).get(recvPacket['TreeID'])
+        share_name = ''
+        if share_info:
+            share_name = str(share_info.get('shareName', ''))
+
+        opened_entry = connData.get('OpenedFiles', {}).get(file_id)
+        is_pipe = False
+        pipe_name = None
+
+        if share_name.upper() == 'IPC$':
+            is_pipe = True
+
+        if opened_entry:
+            file_handle = opened_entry.get('FileHandle')
+            file_name = str(opened_entry.get('FileName', ''))
+            if file_handle == PIPE_FILE_DESCRIPTOR:
+                is_pipe = True
+            if opened_entry.get('VirtualPipe'):
+                is_pipe = True
+                pipe_name = opened_entry.get('PipeName', '')
+            if file_name.upper().startswith('IPC$'):
+                is_pipe = True
+
+        # HONEYPOT: Block write operations to real files in read-only mode, but allow named pipe traffic
+        if HONEYPOT_READ_ONLY and not is_pipe:
             smbServer.log(f"HONEYPOT: BLOCKED WRITE OPERATION from {client_ip} - FileID: {file_id.hex()}", logging.WARNING)
+            
+            # HONEYPOT: Send write attempt alert
+            try:
+                uid = connData.get('Uid')
+                # Look up username from session mapping
+                if hasattr(smbServer, 'honeypot_session_users') and uid in smbServer.honeypot_session_users:
+                    username = smbServer.honeypot_session_users[uid]
+                else:
+                    username = connData.get('UserName', 'unknown')
+                
+                filename = opened_entry.get('FileName', 'unknown') if opened_entry else 'unknown'
+                
+                if hasattr(smbServer, 'send_file_access_alert'):
+                    smbServer.send_file_access_alert(
+                        src_ip=client_ip,
+                        username=username,
+                        filename=filename,
+                        operation='write',
+                        success=False
+                    )
+            except Exception as alert_e:
+                smbServer.log(f'HONEYPOT: Failed to send write blocked alert: {alert_e}', logging.ERROR)
+            
             return [smb2.SMB2Error()], None, STATUS_ACCESS_DENIED
+
+        if is_pipe:
+            honeypot_log(smbServer, f"HONEYPOT: Allowing pipe write to {pipe_name or 'unknown'} from {client_ip}", logging.DEBUG)
+            if opened_entry is not None:
+                pipe_responses = opened_entry.setdefault('PipeResponses', [])
+                buffer = writeRequest['Buffer']
+                if len(buffer) >= 24 and buffer[0] == 5 and buffer[1] == 0:
+                    dcerpc_type = buffer[2]
+                    if dcerpc_type == rpcrt.MSRPC_BIND:
+                        honeypot_log(smbServer, f"HONEYPOT: Captured DCERPC BIND over pipe write from {client_ip}", logging.DEBUG)
+                        pipe_responses.append(Ioctls._craft_dcerpc_bind_ack(buffer))
+                    elif dcerpc_type == rpcrt.MSRPC_REQUEST:
+                        try:
+                            request_header = rpcrt.MSRPCRequestHeader(buffer)
+                            opnum = request_header['op_num']
+                            honeypot_log(smbServer, f"HONEYPOT: Captured DCERPC REQUEST opnum {opnum} over pipe write", logging.DEBUG)
+                            if opnum == 15:
+                                pipe_responses.append(
+                                    Ioctls._craft_net_share_enum_all_response(smbServer, request_header, connData)
+                                )
+                        except Exception as parse_error:
+                            honeypot_log(smbServer, f"HONEYPOT: Failed to parse DCERPC request over pipe write: {parse_error}", logging.DEBUG)
+                opened_entry['PipeResponses'] = pipe_responses
+
+            respSMBCommand['Count'] = writeRequest['Length']
+            respSMBCommand['Remaining'] = 0
+            smbServer.setConnectionData(connId, connData)
+            return [respSMBCommand], None, STATUS_SUCCESS
 
         if writeRequest['FileID'].getData() == b'\xff' * 16:
             # Let's take the data from the lastRequest
@@ -3861,7 +4241,7 @@ class SMB2Commands:
 
         # HONEYPOT: Log SMB2 read
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 read from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 read from {client_ip}", logging.DEBUG)
 
         respSMBCommand = smb2.SMB2Read_Response()
         readRequest = smb2.SMB2Read(recvPacket['Data'])
@@ -3872,7 +4252,7 @@ class SMB2Commands:
         file_id = readRequest['FileID'].getData()
         offset = readRequest['Offset']
         length = readRequest['Length']
-        smbServer.log(f"HONEYPOT: READ request from {client_ip} - FileID: {file_id.hex()}, Offset: {offset}, Length: {length}", logging.DEBUG)
+        honeypot_log(smbServer, f"HONEYPOT: READ request from {client_ip} - FileID: {file_id.hex()}, Offset: {offset}, Length: {length}", logging.DEBUG)
 
         if readRequest['FileID'].getData() == b'\xff' * 16:
             # Let's take the data from the lastRequest
@@ -3894,13 +4274,43 @@ class SMB2Commands:
                         os.lseek(fileHandle, offset, 0)
                         content = os.read(fileHandle, readRequest['Length'])
                     else:
-                        sock = connData['OpenedFiles'][fileID]['Socket']
-                        content = sock.recv(readRequest['Length'])
+                        pipe_entry = connData['OpenedFiles'][fileID]
+                        pipe_responses = pipe_entry.get('PipeResponses', [])
+                        if pipe_responses:
+                            content = pipe_responses.pop(0)
+                            pipe_entry['PipeResponses'] = pipe_responses
+                            honeypot_log(smbServer, f"HONEYPOT: Dequeued pipe response ({len(content)} bytes) for read", logging.DEBUG)
+                        else:
+                            content = b''
+                            honeypot_log(smbServer, "HONEYPOT: Pipe response queue empty, returning empty payload", logging.DEBUG)
 
                     respSMBCommand['DataOffset'] = 0x50
                     respSMBCommand['DataLength'] = len(content)
                     respSMBCommand['DataRemaining'] = 0
                     respSMBCommand['Buffer'] = content
+                    
+                    # HONEYPOT: Send file access alert on successful read
+                    if fileHandle != PIPE_FILE_DESCRIPTOR and len(content) > 0:
+                        try:
+                            filename = connData['OpenedFiles'][fileID].get('FileName', 'unknown')
+                            uid = connData.get('Uid')
+                            # Look up username from session mapping
+                            if hasattr(smbServer, 'honeypot_session_users') and uid in smbServer.honeypot_session_users:
+                                username = smbServer.honeypot_session_users[uid]
+                            else:
+                                username = connData.get('UserName', 'unknown')
+                            
+                            if hasattr(smbServer, 'send_file_access_alert'):
+                                smbServer.send_file_access_alert(
+                                    src_ip=client_ip,
+                                    username=username,
+                                    filename=filename,
+                                    operation='read',
+                                    success=True
+                                )
+                        except Exception as alert_e:
+                            smbServer.log(f'HONEYPOT: Failed to send file access alert: {alert_e}', logging.ERROR)
+                            
                 except Exception as e:
                     smbServer.log('SMB2_READ: %s ' % e, logging.ERROR)
                     errorCode = STATUS_ACCESS_DENIED
@@ -3921,11 +4331,11 @@ class SMB2Commands:
 
         # HONEYPOT: Log SMB2 flush
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 flush from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 flush from {client_ip}", logging.INFO)
 
         # HONEYPOT: Log flush request details
         file_id = flushRequest['FileID'].getData()
-        smbServer.log(f"HONEYPOT: FLUSH request from {client_ip} - FileID: {file_id.hex()}", logging.DEBUG)
+        honeypot_log(smbServer, f"HONEYPOT: FLUSH request from {client_ip} - FileID: {file_id.hex()}", logging.DEBUG)
 
         # Get the Tid associated
         if recvPacket['TreeID'] in connData['ConnectedShares']:
@@ -3951,7 +4361,7 @@ class SMB2Commands:
 
         # HONEYPOT: Log SMB2 query directory
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 query directory from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 query directory from {client_ip}", logging.INFO)
 
         respSMBCommand = smb2.SMB2QueryDirectory_Response()
         queryDirectoryRequest = smb2.SMB2QueryDirectory(recvPacket['Data'])
@@ -3961,7 +4371,7 @@ class SMB2Commands:
         # HONEYPOT: Log directory query details
         file_id = queryDirectoryRequest['FileID'].getData()
         pattern = queryDirectoryRequest['Buffer'].decode('utf-16le') if queryDirectoryRequest['Buffer'] else '*'
-        smbServer.log(f"HONEYPOT: QUERY_DIRECTORY from {client_ip} - FileID: {file_id.hex()}, Pattern: {pattern}", logging.DEBUG)
+        honeypot_log(smbServer, f"HONEYPOT: QUERY_DIRECTORY from {client_ip} - FileID: {file_id.hex()}, Pattern: {pattern}", logging.DEBUG)
 
         # The server MUST locate the tree connection, as specified in section 3.3.5.2.11.
         if (recvPacket['TreeID'] in connData['ConnectedShares']) is False:
@@ -4099,8 +4509,8 @@ class SMB2Commands:
         # HONEYPOT: Log SMB2 change notify
         connData = smbServer.getConnectionData(connId, checkStatus=False)
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 change notify from {client_ip}", logging.INFO)
-        smbServer.log(f"HONEYPOT: CHANGE_NOTIFY request from {client_ip}", logging.DEBUG)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 change notify from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: CHANGE_NOTIFY request from {client_ip}", logging.DEBUG)
 
         return [smb2.SMB2Error()], None, STATUS_NOT_SUPPORTED
 
@@ -4109,8 +4519,8 @@ class SMB2Commands:
         # HONEYPOT: Log SMB2 echo
         connData = smbServer.getConnectionData(connId, checkStatus=False)
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 echo from {client_ip}", logging.INFO)
-        smbServer.log(f"HONEYPOT: ECHO request from {client_ip}", logging.DEBUG)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 echo from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: ECHO request from {client_ip}", logging.DEBUG)
 
         respSMBCommand = smb2.SMB2Echo_Response()
 
@@ -4122,7 +4532,7 @@ class SMB2Commands:
 
         # HONEYPOT: Log SMB2 tree disconnect
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 tree disconnect from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 tree disconnect from {client_ip}", logging.INFO)
 
         respSMBCommand = smb2.SMB2TreeDisconnect_Response()
 
@@ -4130,7 +4540,7 @@ class SMB2Commands:
         if recvPacket['TreeID'] in connData['ConnectedShares']:
             # HONEYPOT: Log share disconnection
             share_name = connData['ConnectedShares'][recvPacket['TreeID']]['shareName']
-            smbServer.log(f"HONEYPOT: Share disconnected from {client_ip} - TreeID: {recvPacket['TreeID']}, Share: {share_name}", logging.INFO)
+            honeypot_log(smbServer, f"HONEYPOT: Share disconnected from {client_ip} - TreeID: {recvPacket['TreeID']}, Share: {share_name}", logging.INFO)
             smbServer.log("Disconnecting Share(%d:%s)" % (
                 recvPacket['TreeID'], share_name))
             del (connData['ConnectedShares'][recvPacket['TreeID']])
@@ -4147,7 +4557,7 @@ class SMB2Commands:
 
         # HONEYPOT: Log SMB2 logoff request
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 logoff request from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 logoff request from {client_ip}", logging.INFO)
 
         respSMBCommand = smb2.SMB2Logoff_Response()
 
@@ -4159,7 +4569,7 @@ class SMB2Commands:
 
         # HONEYPOT: Log session logoff
         user_uid = connData.get('Uid', 0)
-        smbServer.log(f"HONEYPOT: Session logoff from {client_ip} - UID: {user_uid}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: Session logoff from {client_ip} - UID: {user_uid}", logging.INFO)
 
         connData['Uid'] = 0
         connData['Authenticated'] = False
@@ -4176,22 +4586,22 @@ class SMB2Commands:
 
         # HONEYPOT: Log SMB2 IOCTL
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 IOCTL from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 IOCTL from {client_ip}", logging.INFO)
         
         # HONEYPOT: Log IOCTL request details
         ctl_code = ioctlRequest['CtlCode']
-        smbServer.log(f"HONEYPOT: IOCTL request from {client_ip} - CtlCode: 0x{ctl_code:08x}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: IOCTL request from {client_ip} - CtlCode: 0x{ctl_code:08x}", logging.INFO)
         
         # HONEYPOT: Log additional IOCTL details for debugging
-        smbServer.log(f"HONEYPOT: IOCTL FileID: {ioctlRequest['FileID'].getData().hex()}", logging.DEBUG)
-        smbServer.log(f"HONEYPOT: IOCTL Buffer length: {len(ioctlRequest['Buffer'])}", logging.DEBUG)
+        honeypot_log(smbServer, f"HONEYPOT: IOCTL FileID: {ioctlRequest['FileID'].getData().hex()}", logging.DEBUG)
+        honeypot_log(smbServer, f"HONEYPOT: IOCTL Buffer length: {len(ioctlRequest['Buffer'])}", logging.DEBUG)
         if len(ioctlRequest['Buffer']) > 0:
-            smbServer.log(f"HONEYPOT: IOCTL Buffer preview: {ioctlRequest['Buffer'][:50].hex()}", logging.DEBUG)
+            honeypot_log(smbServer, f"HONEYPOT: IOCTL Buffer preview: {ioctlRequest['Buffer'][:50].hex()}", logging.DEBUG)
 
         ioctls = smbServer.getIoctls()
-        smbServer.log(f"HONEYPOT: Available IOCTL handlers: {list(ioctls.keys())}", logging.DEBUG)
+        honeypot_log(smbServer, f"HONEYPOT: Available IOCTL handlers: {list(ioctls.keys())}", logging.DEBUG)
         if ioctlRequest['CtlCode'] in ioctls:
-            smbServer.log(f"HONEYPOT: Calling IOCTL handler for CtlCode: 0x{ioctlRequest['CtlCode']:08x}", logging.INFO)
+            honeypot_log(smbServer, f"HONEYPOT: Calling IOCTL handler for CtlCode: 0x{ioctlRequest['CtlCode']:08x}", logging.INFO)
             outputData, errorCode = ioctls[ioctlRequest['CtlCode']](connId, smbServer, ioctlRequest)
             if errorCode == STATUS_SUCCESS:
                 respSMBCommand['CtlCode'] = ioctlRequest['CtlCode']
@@ -4220,8 +4630,8 @@ class SMB2Commands:
 
         # HONEYPOT: Log SMB2 lock
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 lock from {client_ip}", logging.INFO)
-        smbServer.log(f"HONEYPOT: LOCK request from {client_ip}", logging.DEBUG)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 lock from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: LOCK request from {client_ip}", logging.DEBUG)
 
         # I'm actually doing nothing.. just make MacOS happy ;)
         errorCode = STATUS_SUCCESS
@@ -4234,8 +4644,8 @@ class SMB2Commands:
         # HONEYPOT: Log SMB2 cancel
         connData = smbServer.getConnectionData(connId, checkStatus=False)
         client_ip = connData.get('ClientIP', 'unknown')
-        smbServer.log(f"HONEYPOT: SMB2 cancel from {client_ip}", logging.INFO)
-        smbServer.log(f"HONEYPOT: CANCEL request from {client_ip}", logging.DEBUG)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 cancel from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: CANCEL request from {client_ip}", logging.DEBUG)
         
         # I'm actually doing nothing
         return [smb2.SMB2Error()], None, STATUS_CANCELLED
@@ -4247,7 +4657,7 @@ class SMB2Commands:
         client_ip = connData.get('ClientIP', 'unknown')
         command = recvPacket['Command']
         command_hex = f"0x{command:02x}" if isinstance(command, int) else str(command)
-        smbServer.log(f"HONEYPOT: SMB2 unknown command {command_hex} from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: SMB2 unknown command {command_hex} from {client_ip}", logging.INFO)
         smbServer.log(f"HONEYPOT: Unknown command {command_hex} from {client_ip}", logging.WARNING)
         
         # By default we return an SMB Packet with error not implemented
@@ -4269,143 +4679,388 @@ class Ioctls:
         connData = smbServer.getConnectionData(connId)
         client_ip = connData.get('ClientIP', 'unknown')
         
-        smbServer.log(f"HONEYPOT: fsctlPipeTransceive called for {client_ip} - CtlCode: 0x{ioctlRequest['CtlCode']:08x}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: fsctlPipeTransceive called for {client_ip} - CtlCode: 0x{ioctlRequest['CtlCode']:08x}", logging.INFO)
 
         try:
             # Get the buffer data from the IOCTL request
             buffer_data = ioctlRequest['Buffer']
-            smbServer.log(f"HONEYPOT: fsctlPipeTransceive - Buffer length: {len(buffer_data)}", logging.INFO)
+            honeypot_log(smbServer, f"HONEYPOT: fsctlPipeTransceive - Buffer length: {len(buffer_data)}", logging.INFO)
             
             # Check if this is a DCERPC request
             if len(buffer_data) >= 72 and buffer_data[0] == 5 and buffer_data[1] == 0:  # DCERPC version 5.0
                 dcerpc_type = buffer_data[2]
-                smbServer.log(f"HONEYPOT: DCERPC request detected from {client_ip} - type: {dcerpc_type}", logging.INFO)
+                honeypot_log(smbServer, f"HONEYPOT: DCERPC request detected from {client_ip} - type: {dcerpc_type}", logging.INFO)
                 
-                if dcerpc_type == 11:  # BIND request
-                    smbServer.log(f"HONEYPOT: DCERPC BIND request detected from {client_ip}", logging.INFO)
-                    
-                    # Craft a DCERPC BIND_ACK response
-                    bind_ack_response = Ioctls._craft_dcerpc_bind_ack()
-                    smbServer.log(f"HONEYPOT: Returning DCERPC BIND_ACK response for {client_ip} - length: {len(bind_ack_response)}", logging.INFO)
+                if dcerpc_type == rpcrt.MSRPC_BIND:
+                    honeypot_log(smbServer, f"HONEYPOT: DCERPC BIND request detected from {client_ip}", logging.INFO)
+                    bind_ack_response = Ioctls._craft_dcerpc_bind_ack(buffer_data)
+                    honeypot_log(smbServer, f"HONEYPOT: Returning DCERPC BIND_ACK response for {client_ip} - length: {len(bind_ack_response)}", logging.INFO)
                     return bind_ack_response, STATUS_SUCCESS
                 
-                elif dcerpc_type == 0:  # REQUEST
-                    # Check if this is a NetShareEnumAll request (opnum 15)
-                    if len(buffer_data) >= 100:
-                        # Look for opnum 15 in the DCERPC request
-                        opnum_offset = 24  # Typical position of opnum in DCERPC request
-                        if opnum_offset < len(buffer_data) and buffer_data[opnum_offset] == 15:
-                            smbServer.log(f"HONEYPOT: NetShareEnumAll request detected from {client_ip}", logging.INFO)
-                            
-                            # Craft a NetShareEnumAll response with our honeypot shares
-                            share_enum_response = Ioctls._craft_net_share_enum_all_response()
-                            smbServer.log(f"HONEYPOT: Returning NetShareEnumAll response for {client_ip} - length: {len(share_enum_response)}", logging.INFO)
-                            return share_enum_response, STATUS_SUCCESS
+                elif dcerpc_type == rpcrt.MSRPC_REQUEST:
+                    request_header = rpcrt.MSRPCRequestHeader(buffer_data)
+                    opnum = request_header['op_num']
+                    honeypot_log(smbServer, f"HONEYPOT: DCERPC REQUEST opnum {opnum} detected from {client_ip}", logging.INFO)
+                    
+                    if opnum == 15:  # NetrShareEnum
+                        share_enum_response = Ioctls._craft_net_share_enum_all_response(smbServer, request_header, connData)
+                        honeypot_log(
+                            smbServer,
+                            f"HONEYPOT: Returning NetrShareEnum response for {client_ip} - length: {len(share_enum_response)}",
+                            logging.INFO,
+                        )
+                        return share_enum_response, STATUS_SUCCESS
+                    elif opnum == 16:  # NetrShareGetInfo
+                        share_info_response = Ioctls._craft_net_share_get_info_response(smbServer, request_header, connData)
+                        honeypot_log(smbServer, f"HONEYPOT: Returning NetrShareGetInfo response for {client_ip} - length: {len(share_info_response)}", logging.INFO)
+                        return share_info_response, STATUS_SUCCESS
+                    elif opnum == 21:  # NetrServerGetInfo
+                        server_info_response = Ioctls._craft_server_get_info_response(request_header)
+                        honeypot_log(smbServer, f"HONEYPOT: Returning NetrServerGetInfo response for {client_ip} - length: {len(server_info_response)}", logging.INFO)
+                        return server_info_response, STATUS_SUCCESS
             
-            # For other RPC calls or unrecognized requests, return a default response
-            smbServer.log(f"HONEYPOT: Default pipe transceive for {client_ip} - returning empty response", logging.DEBUG)
-            return b'\x00' * 64, STATUS_SUCCESS
+            # For other RPC calls or unrecognized requests, return a proper DCERPC FAULT response
+            # This is the correct protocol behavior per MS-RPCE specification (RFC 1509)
+            # The FAULT is returned as buffer content within the Ioctl response
+            honeypot_log(smbServer, f"HONEYPOT: Unhandled RPC operation from {client_ip} - returning DCERPC FAULT", logging.DEBUG)
+            try:
+                # Parse the request to get call_id and representation for the response
+                request_header = rpcrt.MSRPCHeader(buffer_data)
+                call_id = request_header['call_id']
+                representation = request_header['representation']
+                ctx_id = request_header.get('ctx_id', 0)
+                
+                # Create a DCERPC FAULT response according to MS-RPCE:
+                # Per RFC 1509 and MS-RPCE, FAULT response structure:
+                #   - type = 0x03 (MSRPC_FAULT)
+                #   - status code (4 bytes) in pduData field
+                fault_resp = rpcrt.MSRPCRespHeader()
+                fault_resp['type'] = rpcrt.MSRPC_FAULT
+                fault_resp['flags'] = rpcrt.PFC_FIRST_FRAG | rpcrt.PFC_LAST_FRAG
+                fault_resp['representation'] = representation
+                fault_resp['call_id'] = call_id
+                fault_resp['ctx_id'] = ctx_id
+                
+                # 0x000006E1 = RPC_S_PROC_NUM_OUT_OF_RANGE (procedure not supported)
+                fault_status = struct.pack('<L', 0x000006E1)
+                fault_resp['pduData'] = fault_status
+                fault_resp['frag_len'] = len(fault_resp.get_packet())
+                
+                fault_packet = fault_resp.get_packet()
+                honeypot_log(smbServer, f"HONEYPOT: Returning DCERPC FAULT response ({len(fault_packet)} bytes) for {client_ip}", logging.DEBUG)
+                return fault_packet, STATUS_SUCCESS
+            except Exception as fault_ex:
+                smbServer.log(f'HONEYPOT: Failed to create FAULT response: %s' % fault_ex, logging.ERROR)
+                # Fallback: return empty buffer if FAULT creation fails
+                honeypot_log(smbServer, f"HONEYPOT: Fallback to empty buffer due to FAULT error", logging.DEBUG)
+                return b'', STATUS_SUCCESS
             
         except Exception as e:
                 smbServer.log(f'HONEYPOT: Pipe transceive error from {client_ip}: %s ' % e, logging.ERROR)
-                return b'\x00' * 64, STATUS_SUCCESS
+                # For outer exceptions, return empty buffer to prevent retries
+                honeypot_log(smbServer, f"HONEYPOT: Exception in pipe transceive - returning empty buffer", logging.DEBUG)
+                return b'', STATUS_SUCCESS
 
     @staticmethod
-    def _craft_dcerpc_bind_ack():
+    def fsctlPipeWait(connId, smbServer, ioctlRequest):
         """
-        Craft a DCERPC BIND_ACK response
-        This is a minimal response that should satisfy the client's binding request
+        Handle FSCTL_PIPE_WAIT (0x900a8) according to MS-FSCC specification.
+        
+        FSCTL_PIPE_WAIT: Wait for a named pipe instance to become available.
+        Since our honeypot doesn't actually wait, we return success immediately.
+        This prevents Windows Explorer from retrying and entering a loop.
+        
+        Per MS-FSCC specification: The server returns STATUS_SUCCESS when the pipe
+        becomes available (immediately in our case) or the timeout expires.
         """
-        # DCERPC BIND_ACK response structure
-        # Based on the working traffic analysis - MUST be exactly 68 bytes
-        response = bytearray()
+        connData = smbServer.getConnectionData(connId)
+        client_ip = connData.get('ClientIP', 'unknown')
         
-        # DCERPC Header
-        response.extend(b'\x05\x00')  # Version 5.0
-        response.extend(b'\x0c')      # Packet type: BIND_ACK (12)
-        response.extend(b'\x03')      # Flags: first + last fragment
-        response.extend(b'\x10\x00\x00\x00')  # Data representation
-        response.extend(b'\x44\x00\x00\x00')  # Fragment length (68 bytes)
-        response.extend(b'\x00\x00\x00\x00')  # Auth length
-        response.extend(b'\x01\x00\x00\x00')  # Call ID (1)
-        response.extend(b'\x00\x00\x00\x00')  # Max transmit frag
-        response.extend(b'\x00\x00\x00\x00')  # Max receive frag
-        response.extend(b'\x26\x4d\x00\x00')  # Assoc group
-        response.extend(b'\x0d\x00\x00\x00')  # Secondary address length
-        response.extend(b'\\PIPE\\srvsvc')    # Secondary address (13 bytes)
-        response.extend(b'\x01\x00\x00\x00')  # Number of results
-        response.extend(b'\x00\x00\x00\x00')  # Result: acceptance
+        honeypot_log(
+            smbServer,
+            f"HONEYPOT: FSCTL_PIPE_WAIT from {client_ip} - returning success immediately",
+            logging.DEBUG,
+        )
         
-        # Transfer syntax UUID (required for DCERPC BIND_ACK) - 12 bytes to achieve 68 total
-        response.extend(b'\x8a\x88\x5d\x04')  # Transfer syntax UUID (first 4 bytes)
-        response.extend(b'\x1c\xeb\x11\xc9')  # Transfer syntax UUID (next 4 bytes)
-        response.extend(b'\x02\x00\x00\x00')  # Transfer syntax version
-        
-        # Verify the response is exactly 68 bytes
-        assert len(response) == 68, f"BIND_ACK response must be exactly 68 bytes, got {len(response)}"
-        
-        return bytes(response)
+        # FSCTL_PIPE_WAIT response: empty buffer with STATUS_SUCCESS
+        # The client interprets this as "pipe became available"
+        # Return format: (response_buffer, status_code)
+        smbServer.setConnectionData(connId, connData)
+        return b'', STATUS_SUCCESS
 
     @staticmethod
-    def _craft_net_share_enum_all_response():
+    def fsctlPipePeek(connId, smbServer, ioctlRequest):
         """
-        Craft a NetShareEnumAll response containing "PUBLIC" and "IPC$" shares.
-        This returns PUBLIC and IPC$ shares to make the honeypot look realistic
+        Handle FSCTL_PIPE_PEEK so Windows clients polling a named pipe don't hit an error loop.
+        Returns basic metadata about queued pipe responses without consuming them.
         """
-        # NetShareEnumAll response structure
-        # Based on the working traffic analysis
-        response = bytearray()
+        connData = smbServer.getConnectionData(connId)
+        client_ip = connData.get('ClientIP', 'unknown')
+
+        honeypot_log(
+            smbServer,
+            f"HONEYPOT: fsctlPipePeek from {client_ip} - CtlCode: 0x{ioctlRequest['CtlCode']:08x}",
+            logging.DEBUG,
+        )
+
+        file_id = ioctlRequest['FileID'].getData()
+        total_available = 0
+        number_of_messages = 0
+        first_message_length = 0
+        peek_payload = b''
+
+        opened_files = connData.get('OpenedFiles', {})
+        if file_id in opened_files:
+            entry = opened_files[file_id]
+            pipe_responses = entry.get('PipeResponses', [])
+            if pipe_responses:
+                number_of_messages = len(pipe_responses)
+                total_available = sum(len(chunk) for chunk in pipe_responses)
+                first_message_length = len(pipe_responses[0])
+                requested_max = ioctlRequest['MaxOutputResponse']
+                header_size = 12  # three DWORDs
+                data_budget = max(0, (requested_max or header_size + len(pipe_responses[0])) - header_size)
+                peek_payload = pipe_responses[0][:data_budget]
+                honeypot_log(
+                    smbServer,
+                    (
+                        f"HONEYPOT: Pipe peek queue for {client_ip} "
+                        f"(messages={number_of_messages}, first_len={first_message_length}, "
+                        f"total={total_available})"
+                    ),
+                    logging.DEBUG,
+                )
+            else:
+                honeypot_log(smbServer, f"HONEYPOT: Pipe peek queue empty for {client_ip}", logging.DEBUG)
+        else:
+            honeypot_log(
+                smbServer,
+                f"HONEYPOT: Pipe peek requested for unknown FileID {file_id.hex()} from {client_ip}",
+                logging.DEBUG,
+            )
+
+        header = struct.pack('<III', total_available, number_of_messages, first_message_length)
+        max_output = ioctlRequest['MaxOutputResponse']
+        if max_output and max_output < len(header):
+            response = header[:max_output]
+        else:
+            response = header
+            if max_output:
+                remaining_budget = max_output - len(header)
+                response += peek_payload[:remaining_budget]
+            else:
+                response += peek_payload
+
+        smbServer.setConnectionData(connId, connData)
+        return response, STATUS_SUCCESS
+
+    @staticmethod
+    def fsctlCreateOrGetObjectId(connId, smbServer, ioctlRequest):
+        """
+        Handle FSCTL_CREATE_OR_GET_OBJECT_ID requests on files or directories.
+        Return STATUS_INVALID_DEVICE_REQUEST to prevent Windows Explorer from retrying.
         
-        # DCERPC Header
-        response.extend(b'\x05\x00')  # Version 5.0
-        response.extend(b'\x02')      # Packet type: RESPONSE (2)
-        response.extend(b'\x03')      # Flags: first + last fragment
-        response.extend(b'\x10\x00\x00\x00')  # Data representation
-        response.extend(b'\x40\x02\x00\x00')  # Fragment length (576 bytes)
-        response.extend(b'\x00\x00\x00\x00')  # Auth length
-        response.extend(b'\x00\x00\x00\x00')  # Call ID (0)
-        response.extend(b'\x28\x02\x00\x00')  # Alloc hint (552 bytes)
-        response.extend(b'\x00\x00\x00\x00')  # Context ID
-        response.extend(b'\x00')              # Cancel count
-        response.extend(b'\x0f')              # Opnum (15 = NetShareEnumAll)
+        REASON FOR RETURNING ERROR:
+        Windows Explorer tries to get Object IDs for file preview/thumbnail generation.
+        When we return SUCCESS, it causes a retry loop where it keeps calling QueryDir -> Ioctl -> QueryDir.
+        By returning an error, Windows Explorer gracefully falls back to other methods and doesn't retry.
+        """
+        connData = smbServer.getConnectionData(connId)
+        client_ip = connData.get('ClientIP', 'unknown')
+        file_id = ioctlRequest['FileID'].getData()
         
-        # NetShareEnumAll response stub data
-        # This is a simplified response with our honeypot shares
-        response.extend(b'\x00\x00\x00\x00')  # Return code (success)
-        response.extend(b'\x00\x00\x00\x00')  # Info level (1)
-        response.extend(b'\x00\x00\x00\x00')  # Share count (2)
+        smbServer.log(
+            f"HONEYPOT: FSCTL_CREATE_OR_GET_OBJECT_ID rejected for FileID {file_id.hex()} from {client_ip} (prevents Windows Explorer retry loop)",
+            logging.DEBUG,
+        )
         
-        # Share 1: PUBLIC
-        response.extend(b'\x00\x00\x00\x00')  # Referent ID for name
-        response.extend(b'\x06\x00\x00\x00')  # Name length
-        response.extend(b'\x00\x00')          # Name offset
-        response.extend(b'\x06\x00\x00\x00')  # Name actual count
-        response.extend(b'PUBLIC')            # Share name
-        response.extend(b'\x00\x00')          # Padding
-        response.extend(b'\x00\x00\x00\x00')  # Share type (0 = disk)
-        response.extend(b'\x00\x00\x00\x00')  # Referent ID for comment
-        response.extend(b'\x00\x00\x00\x00')  # Comment length
-        response.extend(b'\x00\x00')          # Comment offset
-        response.extend(b'\x00\x00\x00\x00')  # Comment actual count
-        
-        # Share 2: IPC$
-        response.extend(b'\x00\x00\x00\x00')  # Referent ID for name
-        response.extend(b'\x04\x00\x00\x00')  # Name length
-        response.extend(b'\x00\x00')          # Name offset
-        response.extend(b'\x04\x00\x00\x00')  # Name actual count
-        response.extend(b'IPC$')              # Share name
-        response.extend(b'\x00\x00')          # Padding
-        response.extend(b'\x02\x00\x00\x00')  # Share type (2 = named pipe)
-        response.extend(b'\x00\x00\x00\x00')  # Referent ID for comment
-        response.extend(b'\x00\x00\x00\x00')  # Comment length
-        response.extend(b'\x00\x00')          # Comment offset
-        response.extend(b'\x00\x00\x00\x00')  # Comment actual count
-        
-        # Pad to match expected length
-        while len(response) < 576:
-            response.extend(b'\x00')
-        
-        return bytes(response)
+        # Return SMB2Error for error responses (required by smb2Ioctl handler)
+        # STATUS_INVALID_DEVICE_REQUEST = 0xC0000010
+        # This tells Windows Explorer: "this filesystem doesn't support Object IDs"
+        return smb2.SMB2Error(), 0xC0000010
+
+    @staticmethod
+    def _craft_dcerpc_bind_ack(buffer_data):
+        """
+        Craft a DCERPC BIND_ACK response using Impacket's structures to ensure correctness
+        """
+        packet = rpcrt.MSRPCHeader(buffer_data)
+        bind_request = rpcrt.MSRPCBind(packet['pduData'])
+
+        ack = rpcrt.MSRPCBindAck()
+        ack['type'] = rpcrt.MSRPC_BINDACK
+        ack['flags'] = rpcrt.PFC_FIRST_FRAG | rpcrt.PFC_LAST_FRAG
+        ack['representation'] = packet['representation']
+        ack['call_id'] = packet['call_id']
+        ack['max_tfrag'] = bind_request['max_tfrag']
+        ack['max_rfrag'] = bind_request['max_rfrag']
+        ack['assoc_group'] = 0x1234
+        secondary_addr = '\\PIPE\\srvsvc'
+        ack['SecondaryAddr'] = secondary_addr
+        ack['SecondaryAddrLen'] = len(secondary_addr) + 1  # include terminating NULL per spec
+        ack['Pad'] = b'\x00' * ((4 - ((ack["SecondaryAddrLen"] + rpcrt.MSRPCBindAck._SIZE) % 4)) % 4)
+
+        ctx_items = b''
+        data = bind_request['ctx_items']
+        ack['ctx_num'] = 0
+
+        for i in range(bind_request['ctx_num']):
+            item = rpcrt.CtxItem(data)
+            data = data[len(item):]
+
+            ctx_result = rpcrt.CtxItemResult()
+            if item['TransferSyntax'] == impacket_uuid.uuidtup_to_bin(('8a885d04-1ceb-11c9-9fe8-08002b104860', '2.0')):
+                ctx_result['Result'] = rpcrt.MSRPC_CONT_RESULT_ACCEPT
+                ctx_result['Reason'] = 0
+            else:
+                ctx_result['Result'] = rpcrt.MSRPC_CONT_RESULT_PROV_REJECT
+                ctx_result['Reason'] = 2
+
+            ctx_result['TransferSyntax'] = item['TransferSyntax']
+            ctx_items += ctx_result.getData()
+            ack['ctx_num'] += 1
+
+        ack['ctx_items'] = ctx_items
+        ack['auth_len'] = 0
+        ack['auth_data'] = b''
+        ack['frag_len'] = len(ack.getData())
+        ack_data = ack.getData()
+        logging.getLogger('impacket.smbserver').log(logging.DEBUG, f"HONEYPOT: Crafted BIND_ACK payload ({len(ack_data)} bytes): {ack_data.hex()}")
+        return ack_data
+
+    @staticmethod
+    def _craft_net_share_enum_all_response(smbServer, request_header, connData):
+        """
+        Craft a NetShareEnum response using Impacket's SRVS structures so Windows/macOS see normal share listings.
+        """
+        shares = Ioctls._get_share_definitions(smbServer).values()
+
+        share_enum = NetrShareEnumResponse()
+        share_enum['InfoStruct']['Level'] = 1
+        share_enum['InfoStruct']['ShareInfo']['tag'] = 1
+        share_enum['InfoStruct']['ShareInfo']['Level1']['EntriesRead'] = len(shares)
+        share_enum['TotalEntries'] = len(shares)
+        share_enum['ErrorCode'] = 0
+        share_enum['ResumeHandle'] = NULL
+
+        for share in shares:
+            share_info = SHARE_INFO_1()
+            share_info['shi1_netname'] = share['netname'] + '\x00'
+            share_info['shi1_type'] = share['type']
+            remark = share.get('remark', '')
+            share_info['shi1_remark'] = remark + '\x00'
+            share_enum['InfoStruct']['ShareInfo']['Level1']['Buffer'].append(share_info)
+
+        stub_data = share_enum.getData()
+
+        response = rpcrt.MSRPCRespHeader()
+        response['type'] = rpcrt.MSRPC_RESPONSE
+        response['flags'] = rpcrt.PFC_FIRST_FRAG | rpcrt.PFC_LAST_FRAG
+        response['representation'] = request_header['representation']
+        response['call_id'] = request_header['call_id']
+        response['ctx_id'] = request_header['ctx_id']
+        response['alloc_hint'] = len(stub_data)
+        response['pduData'] = stub_data
+        response['frag_len'] = len(response.get_packet())
+
+        return response.get_packet()
+
+    @staticmethod
+    def _craft_net_share_get_info_response(smbServer, request_header, connData):
+        shares = Ioctls._get_share_definitions(smbServer)
+        request = NetrShareGetInfo(request_header['pduData'])
+        share_name = request['NetName'][:-1].upper()
+        level = request['Level']
+
+        response = NetrShareGetInfoResponse()
+        response['InfoStruct']['tag'] = level
+
+        if share_name in shares:
+            share = shares[share_name]
+            if level == 1:
+                info = response['InfoStruct']['ShareInfo1']
+                info['shi1_netname'] = share['netname'] + '\x00'
+                info['shi1_type'] = share['type']
+                info['shi1_remark'] = share['remark'] + '\x00'
+                response['ErrorCode'] = 0
+            elif level == 0:
+                info = response['InfoStruct']['ShareInfo0']
+                info['shi0_netname'] = share['netname'] + '\x00'
+                info['shi0_type'] = share['type']
+                response['ErrorCode'] = 0
+            else:
+                response['InfoStruct']['tag'] = 1
+                response['InfoStruct']['ShareInfo1'] = NULL
+                response['ErrorCode'] = ERROR_INVALID_LEVEL
+            response['InfoStruct']['ShareInfo1'] = NULL
+            response['ErrorCode'] = ERROR_INVALID_LEVEL
+        else:
+            response['InfoStruct']['tag'] = 1
+            response['InfoStruct']['ShareInfo1'] = NULL
+            response['ErrorCode'] = 0x00000906  # WERR_NET_NAME_NOT_FOUND
+
+        return response.getData()
+
+    @staticmethod
+    def _craft_server_get_info_response(request_header):
+        request = NetrServerGetInfo(request_header['pduData'])
+        level = request['Level']
+        response = NetrServerGetInfoResponse()
+        response['InfoStruct']['tag'] = level
+
+        if level == 100:
+            info = response['InfoStruct']['ServerInfo100']
+            info['sv100_platform_id'] = 500
+            info['sv100_name'] = request['ServerName']
+            info['sv100_version_major'] = 6
+            info['sv100_version_minor'] = 1
+            info['sv100_type'] = 1
+            info['sv100_comment'] = NULL
+            response['ErrorCode'] = 0
+        elif level == 101:
+            info = response['InfoStruct']['ServerInfo101']
+            info['sv101_platform_id'] = 500
+            info['sv101_name'] = request['ServerName']
+            info['sv101_version_major'] = 6
+            info['sv101_version_minor'] = 1
+            info['sv101_type'] = 1
+            info['sv101_comment'] = NULL
+            info['sv101_users'] = 5
+            info['sv101_disc'] = 0
+            info['sv101_hidden'] = 0
+            info['sv101_announce'] = 0
+            info['sv101_announce_delta'] = 0
+            info['sv101_licenses'] = 0
+            info['sv101_userpath'] = NULL
+            response['ErrorCode'] = 0
+        else:
+            response['InfoStruct']['tag'] = 101
+            response['InfoStruct']['ServerInfo101'] = NULL
+            response['ErrorCode'] = ERROR_INVALID_LEVEL
+
+        return response.getData()
+
+    @staticmethod
+    def _get_share_definitions(smbServer):
+        defined = getattr(smbServer, 'honeypot_shares', None)
+        if not defined:
+            defined = [
+                {'netname': 'PUBLIC', 'type': STYPE_DISKTREE, 'remark': 'Public Share'},
+                {'netname': 'IPC$', 'type': STYPE_IPC, 'remark': 'Remote IPC'}
+            ]
+
+        normalized = {}
+        for share in defined:
+            raw_name = share.get('netname', '')
+            if not raw_name:
+                continue
+            key = raw_name.upper()
+            normalized[key] = {
+                'netname': raw_name,
+                'type': share.get('type', STYPE_DISKTREE),
+                'remark': share.get('remark', '')
+            }
+        return normalized
 
     @staticmethod
     def fsctlValidateNegotiateInfo(connId, smbServer, ioctlRequest):
@@ -4429,7 +5084,7 @@ class Ioctls:
         connData = smbServer.getConnectionData(connId)
         client_ip = connData.get('ClientIP', 'unknown')
         
-        smbServer.log(f"HONEYPOT: Share enumeration IOCTL from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: Share enumeration IOCTL from {client_ip}", logging.INFO)
         
         # Create a response with our honeypot shares
         # This is what smbutil view needs to see
@@ -4449,7 +5104,7 @@ class Ioctls:
         shares_data += b'\x03\x00\x00\x00'  # Share type (IPC)
         shares_data += b'Remote IPC' + b'\x00' * (48 - len('Remote IPC'))  # Comment (48 bytes)
         
-        smbServer.log(f"HONEYPOT: Share enumeration completed for {client_ip} - Found 2 shares", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: Share enumeration completed for {client_ip} - Found 2 shares", logging.INFO)
         
         smbServer.setConnectionData(connId, connData)
         return shares_data, STATUS_SUCCESS
@@ -4460,13 +5115,13 @@ class Ioctls:
         connData = smbServer.getConnectionData(connId)
         client_ip = connData.get('ClientIP', 'unknown')
         
-        smbServer.log(f"HONEYPOT: Workstation info IOCTL from {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: Workstation info IOCTL from {client_ip}", logging.INFO)
         
         # Return basic workstation info
         wksta_info = b'TROPICO-HONEYPOT' + b'\x00' * 16  # Computer name
         wksta_info += b'WORKGROUP' + b'\x00' * 16  # Workgroup name
         
-        smbServer.log(f"HONEYPOT: Workstation info provided for {client_ip}", logging.INFO)
+        honeypot_log(smbServer, f"HONEYPOT: Workstation info provided for {client_ip}", logging.INFO)
         
         smbServer.setConnectionData(connId, connData)
         return wksta_info, STATUS_SUCCESS
@@ -4517,9 +5172,6 @@ class SMBSERVERHandler(socketserver.BaseRequestHandler):
                     r.set_trailer(p.get_trailer())
                     self.__request.send(r.rawData())
                 else:
-                    # HONEYPOT: Log SMB request processing
-                    self.__SMB.log(f"HONEYPOT: Processing SMB request from {self.__ip}:{self.__port}", logging.DEBUG)
-                    
                     resp = self.__SMB.processRequest(self.__connId, p.get_trailer())
                     # Send all the packets received. Except for big transactions this should be
                     # a single packet
@@ -4645,8 +5297,9 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
         self.__smb2Ioctls = {
             smb2.FSCTL_DFS_GET_REFERRALS: self.__IoctlHandler.fsctlDfsGetReferrals,
-            # smb2.FSCTL_PIPE_PEEK:                    self.__IoctlHandler.fsctlPipePeek,
-            # smb2.FSCTL_PIPE_WAIT:                    self.__IoctlHandler.fsctlPipeWait,
+            smb2.FSCTL_PIPE_PEEK: self.__IoctlHandler.fsctlPipePeek,
+            0x000900C0: self.__IoctlHandler.fsctlCreateOrGetObjectId,
+            0x000900A8: self.__IoctlHandler.fsctlPipeWait,  # FSCTL_PIPE_WAIT
             smb2.FSCTL_PIPE_TRANSCEIVE: self.__IoctlHandler.fsctlPipeTransceive,
             # smb2.FSCTL_SRV_COPYCHUNK:                self.__IoctlHandler.fsctlSrvCopyChunk,
             # smb2.FSCTL_SRV_ENUMERATE_SNAPSHOTS:      self.__IoctlHandler.fsctlSrvEnumerateSnapshots,
@@ -4988,7 +5641,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
             
             # HONEYPOT: Log SMB2 packet
             client_ip = connData.get('ClientIP', 'unknown')
-            self.log(f"HONEYPOT: SMB2 packet from {client_ip} - Command: 0x{packet['Command']:02x}, MessageID: {packet['MessageID']}", logging.DEBUG)
+            honeypot_log(self, f"HONEYPOT: SMB2 packet from {client_ip} - Command: 0x{packet['Command']:02x}, MessageID: {packet['MessageID']}", logging.DEBUG)
 
         connData = self.getConnectionData(connId, False)
 
@@ -5118,7 +5771,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                                     self,
                                     packet)
                                     # HONEYPOT: Log hook execution
-                                    self.log(f"HONEYPOT: Custom hook executed for SMB2 command 0x{packet['Command']:02x}", logging.INFO)
+                                    honeypot_log(self, f"HONEYPOT: Custom hook executed for SMB2 command 0x{packet['Command']:02x}", logging.DEBUG)
                                 else:
                                     # Default handler
                                     respCommands, respPackets, errorCode = self.__smb2Commands[packet['Command']](
@@ -5126,7 +5779,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                                         self,
                                         packet)
                                     # HONEYPOT: Log default handler execution
-                                    self.log(f"HONEYPOT: Default handler for SMB2 command 0x{packet['Command']:02x}", logging.DEBUG)
+                                    honeypot_log(self, f"HONEYPOT: Default handler for SMB2 command 0x{packet['Command']:02x}", logging.DEBUG)
                             else:
                                 respCommands, respPackets, errorCode = self.__smb2Commands[255](connId, self, packet)
                         else:
@@ -5135,7 +5788,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                             self.log(f"HONEYPOT: Unknown SMB2 command 0x{packet['Command']:02x} - using default handler", logging.WARNING)
                         
                         # HONEYPOT: Log command processing result
-                        self.log(f"HONEYPOT: SMB2 command 0x{packet['Command']:02x} processed - Status: 0x{errorCode:08x}", logging.DEBUG)
+                        honeypot_log(self, f"HONEYPOT: SMB2 command 0x{packet['Command']:02x} processed - Status: 0x{errorCode:08x}", logging.DEBUG)
                         
                         # Let's store the result for this compounded packet
                         compoundedPacketsResponse.append((respCommands, respPackets, errorCode))
@@ -5144,7 +5797,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                             data = data[packet['NextCommand']:]
                             packet = smb2.SMB2Packet(data=data)
                             # HONEYPOT: Log next compound command
-                            self.log(f"HONEYPOT: Next compound command: 0x{packet['Command']:02x}", logging.DEBUG)
+                            honeypot_log(self, f"HONEYPOT: Next compound command: 0x{packet['Command']:02x}", logging.DEBUG)
                         else:
                             done = True
 
@@ -5243,7 +5896,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
         if isSMB2 is True:
             # HONEYPOT: Log SMB2 response building
             client_ip = connData.get('ClientIP', 'unknown')
-            self.log(f"HONEYPOT: Building SMB2 response for {client_ip} - {len(packetsToSend)} packets", logging.DEBUG)
+            honeypot_log(self, f"HONEYPOT: Building SMB2 response for {client_ip} - {len(packetsToSend)} packets", logging.DEBUG)
             
             # Let's build a compound answer and sign it
             finalData = []
@@ -5262,7 +5915,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                     finalData.append(packet + padLen * b'\x00')
 
             packetsToSend = [b"".join(finalData)]
-            self.log(f"HONEYPOT: SMB2 response built - {len(finalData)} components, total size: {len(packetsToSend[0])}", logging.DEBUG)
+            honeypot_log(self, f"HONEYPOT: SMB2 response built - {len(finalData)} components, total size: {len(packetsToSend[0])}", logging.DEBUG)
             
             # HONEYPOT: Log response details
             for idx, packet in enumerate(packetsToSend):
@@ -5272,7 +5925,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
                     # Convert to hex strings safely
                     command_hex = f"0x{command:02x}" if isinstance(command, int) else str(command)
                     status_hex = f"0x{status:08x}" if isinstance(status, int) else str(status)
-                    self.log(f"HONEYPOT: Response packet {idx} - Command: {command_hex}, Status: {status_hex}", logging.DEBUG)
+                    honeypot_log(self, f"HONEYPOT: Response packet {idx} - Command: {command_hex}, Status: {status_hex}", logging.DEBUG)
 
         # We clear the compound requests
         connData['LastRequest'] = {}
@@ -5280,7 +5933,7 @@ class SMBSERVER(socketserver.ThreadingMixIn, socketserver.TCPServer):
         # HONEYPOT: Log final response
         client_ip = connData.get('ClientIP', 'unknown')
         total_packets = len(packetsToSend)
-        self.log(f"HONEYPOT: Sending {total_packets} response packets to {client_ip}", logging.DEBUG)
+        honeypot_log(self, f"HONEYPOT: Sending {total_packets} response packets to {client_ip}", logging.DEBUG)
 
         return packetsToSend
 
@@ -5381,13 +6034,6 @@ PIPE_FILE_DESCRIPTOR = -2
 ######################################################################
 
 from impacket.dcerpc.v5.rpcrt import DCERPCServer
-from impacket.dcerpc.v5.dtypes import NULL
-from impacket.dcerpc.v5.srvs import NetrShareEnum, NetrShareEnumResponse, SHARE_INFO_1, NetrServerGetInfo, \
-    NetrServerGetInfoResponse, NetrShareGetInfo, NetrShareGetInfoResponse
-from impacket.dcerpc.v5.wkst import NetrWkstaGetInfo, NetrWkstaGetInfoResponse
-from impacket.system_errors import ERROR_INVALID_LEVEL
-
-
 class WKSTServer(DCERPCServer):
     def __init__(self):
         DCERPCServer.__init__(self)
